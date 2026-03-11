@@ -1,0 +1,62 @@
+# ── Virtual environment ───────────────────────────────────────
+toxguard_env/
+
+# ── Python cache ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# ── Jupyter ───────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ══════════════════════════════════════════════════════════════
+# iupacGPT — keep source code, ignore large corpus/weight files
+# ══════════════════════════════════════════════════════════════
+
+# 2.7 GB PubChem SMILES corpus (training data for iupacGPT, not needed for inference)
+iupacGPT/iupac-gpt/iupac_gpt/pubchem_iupac_smile_gpt.csv
+
+# 149 MB IUPAC name corpus
+iupacGPT/iupac-gpt/iupac.txt
+
+# 12 MB classification training corpus
+iupacGPT/iupac-gpt/class.txt
+
+# 3.6 MB generated output file
+iupacGPT/iupac-gpt/iupacGPT2-gen50K.csv
+
+# Duplicate logP training data (7.5 MB each)
+iupacGPT/iupac-gpt/data/iupacs_logp.csv
+iupacGPT/iupac-gpt/iupac_gpt/iupacs_logp.csv
+
+# Pretrained model weights (download from original iupacGPT repo)
+iupacGPT/iupac-gpt/checkpoints/iupac/pytorch_model.bin
+iupacGPT/iupac-gpt/checkpoints/iupac/model.safetensors
+iupacGPT/iupac-gpt/checkpoints/iupac/*.bin
+iupacGPT/iupac-gpt/checkpoints/iupac/*.safetensors
+iupacGPT/iupac-gpt/pretrained/
+
+# ══════════════════════════════════════════════════════════════
+# Training outputs — keep weights + reports, skip large files
+# ══════════════════════════════════════════════════════════════
+
+# ── API resolution cache (generated, can be re-created) ───────
+data/iupac_cs_failed_cache.csv
+data/iupac_failed_cache.csv
+data/iupac_name_cache.csv
+
+# ── OS / editor noise ─────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Environment / secrets ─────────────────────────────────────
+.env
+*.key

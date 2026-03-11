@@ -1,0 +1,1345 @@
+#!/usr/bin/env python3
+"""Build common_molecules_raw.csv — molecules with short IUPAC names.
+
+Uses the actual IUPAC SentencePiece tokenizer to measure token length.
+Only molecules whose IUPAC name encodes to 1-MAX_TOKENS tokens are kept.
+
+All entries use PROPER IUPAC names:
+  - Systematic IUPAC (preferred):   methane, propan-2-one, ethanoic acid
+  - IUPAC-retained trivial names:   benzene, glycine, glucose, urea, adenine
+
+NO trade/common names: aspirin, ibuprofen, caffeine, beeswax, PEG etc.
+
+Usage:
+  python steps/build_common_molecules.py              # default max 15 tokens
+  python steps/build_common_molecules.py --max_tokens 9
+  python steps/build_common_molecules.py --max_tokens 12 --show_dropped
+
+Output:  data/common_molecules_raw.csv
+Columns: iupac_name, is_toxic, token_count
+"""
+
+import os
+import sys
+import csv
+import argparse
+import logging
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+logging.basicConfig(level=logging.WARNING)
+
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+SPM_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "iupacGPT", "iupac-gpt", "iupac_gpt", "iupac_spm.model"
+)
+
+# ------------------------------------------------------------------------------
+# CANDIDATE LIST  —  (iupac_name, is_toxic)
+# is_toxic=1 → known toxicant / hazardous at typical exposure
+# is_toxic=0 → GRAS / safe at normal use / therapeutic compound
+#
+# Rules:
+#   1. IUPAC systematic or IUPAC-retained trivial name only (no trade names)
+#   2. First occurrence wins on dedup
+#   3. Entries not passing the token filter are silently dropped at runtime
+# ------------------------------------------------------------------------------
+
+CANDIDATES = [
+
+    # -- Alkanes ---------------------------------------------------------------
+    ("methane",                             0),
+    ("ethane",                              0),
+    ("propane",                             0),
+    ("butane",                              0),
+    ("pentane",                             0),
+    ("hexane",                              1),   # neurotoxic (occupational)
+    ("heptane",                             1),   # Cat 1 aspiration hazard, CNS depressant
+    ("octane",                              0),
+    ("nonane",                              0),
+    ("decane",                              0),
+    ("undecane",                            0),
+    ("dodecane",                            0),
+    ("2-methylpropane",                     0),   # isobutane
+    ("2-methylbutane",                      0),
+    ("2,2-dimethylpropane",                 0),
+    ("cyclopropane",                        0),
+    ("cyclobutane",                         0),
+    ("cyclopentane",                        0),
+    ("cyclohexane",                         0),
+    ("cycloheptane",                        0),
+    ("methylcyclopentane",                  0),
+    ("methylcyclohexane",                   0),
+    ("ethylcyclohexane",                    0),
+    ("2-methylpentane",                     0),
+    ("3-methylpentane",                     0),
+    ("2,3-dimethylbutane",                  0),
+    ("2-methylhexane",                      0),
+    ("3-methylhexane",                      0),
+
+    # -- Alkenes ---------------------------------------------------------------
+    ("ethene",                              0),
+    ("prop-1-ene",                             0),
+    ("but-1-ene",                           0),
+    ("but-2-ene",                           0),
+    ("2-methylprop-1-ene",                     0),
+    ("pent-1-ene",                          0),
+    ("pent-2-ene",                          0),
+    ("hex-1-ene",                           0),
+    ("cyclohexene",                         0),
+    ("cyclopentene",                        0),
+    ("buta-1,3-diene",                       1),   # carcinogen
+    ("2-methylbuta-1,3-diene",              0),   # isoprene (low odour threshold)
+    ("ethenylbenzene",                             1),   # probable carcinogen
+
+    # -- Alkynes ---------------------------------------------------------------
+    ("ethyne",                              0),
+    ("prop-1-yne",                             0),
+    ("but-1-yne",                           0),
+    ("but-2-yne",                           0),
+    ("pent-1-yne",                          0),
+
+    # -- Aromatic hydrocarbons -------------------------------------------------
+    ("benzene",                             1),   # IARC Group 1 carcinogen
+    ("methylbenzene",                       1),   # toluene - CNS depressant, reproductive toxicant
+    ("ethylbenzene",                        1),   # IARC 2B, ototoxic, CNS depressant
+    ("1,2-dimethylbenzene",                 1),   # o-xylene - CNS/neurotoxic
+    ("1,3-dimethylbenzene",                 1),   # m-xylene - CNS/neurotoxic
+    ("1,4-dimethylbenzene",                 1),   # p-xylene - CNS/neurotoxic
+    ("propylbenzene",                       1),   # CNS depressant, aspiration hazard
+    ("isopropylbenzene",                    1),   # cumene - CNS depressant, corrosive
+    ("1,2,3-trimethylbenzene",              1),   # CNS depressant, irritant
+    ("1,2,4-trimethylbenzene",              1),   # CNS depressant, irritant
+    ("1,3,5-trimethylbenzene",              1),   # mesitylene - CNS depressant
+    ("naphthalene",                         1),   # IARC 2B, hemolytic anemia
+    ("azulene",                             0),
+    ("1,1'-biphenyl",                            0),
+    ("1H-indene",                              0),
+    ("anthracene",                          1),
+    ("phenanthrene",                        1),
+    ("9H-fluorene",                            0),
+    ("pyrene",                              1),
+    ("fluoranthene",                        1),
+    ("acenaphthylene",                      1),
+    ("1,2-dihydroacenaphthylene",                        1),
+    ("chrysene",                            1),
+    ("triphenylene",                        1),
+
+    # -- Alcohols -------------------------------------------------------------
+    ("methanol",                            1),   # toxic
+    ("ethanol",                             0),
+    ("propan-1-ol",                         0),
+    ("propan-2-ol",                         0),
+    ("butan-1-ol",                          0),
+    ("butan-2-ol",                          0),
+    ("2-methylpropan-1-ol",                 0),
+    ("2-methylpropan-2-ol",                 0),
+    ("pentan-1-ol",                         0),
+    ("pentan-2-ol",                         0),
+    ("pentan-3-ol",                         0),
+    ("3-methylbutan-1-ol",                  0),
+    ("hexan-1-ol",                          0),
+    ("heptan-1-ol",                         0),
+    ("octan-1-ol",                          0),
+    ("nonan-1-ol",                          0),
+    ("decan-1-ol",                          0),
+    ("prop-2-en-1-ol",                      1),   # allyl alcohol — hepatotoxic
+    ("cyclopentanol",                       0),
+    ("cyclohexanol",                        0),
+    ("phenylmethanol",                      1),   # benzyl alcohol - CNS depressant, metabolite of toluene
+    ("2-phenylethanol",                     0),
+    ("hydroxybenzene",                              1),   # corrosive/toxic
+    ("2-methylphenol",                      1),
+    ("3-methylphenol",                      1),
+    ("4-methylphenol",                      1),
+    ("2-ethylphenol",                       1),
+    ("4-ethylphenol",                       1),
+    ("2,4-dimethylphenol",                  1),
+    ("4-propylphenol",                      1),
+    ("naphthalen-1-ol",                     1),
+    ("naphthalen-2-ol",                     1),
+
+    # -- Polyols / glycols -----------------------------------------------------
+    ("ethane-1,2-diol",                     1),   # ethylene glycol — toxic
+    ("propane-1,2-diol",                    0),   # propylene glycol — GRAS
+    ("propane-1,3-diol",                    0),
+    ("butane-1,4-diol",                     1),
+    ("butane-2,3-diol",                     0),
+    ("propane-1,2,3-triol",                 0),   # glycerol
+
+    # -- Ethers ---------------------------------------------------------------
+    ("methoxymethane",                      0),   # dimethyl ether
+    ("ethoxyethane",                        0),   # diethyl ether
+    ("methoxybenzene",                      1),   # anisole - aromatic ether, GHS Cat 4 harmful
+    ("ethoxybenzene",                       1),   # phenetole - aromatic ether, harmful
+    ("1-methoxypropane",                    0),
+    ("2-methoxypropane",                    0),
+    ("1-methoxybutane",                     0),
+    ("1,4-dioxane",                         1),   # carcinogen
+    ("oxolane",                     1),   # CNS depressant
+    ("furan",                               1),   # probable carcinogen
+    ("1,3-dioxolane",                       0),
+    ("1,3,5-trioxane",                      0),
+    ("oxetane",                             0),
+    ("oxirane",                             1),   # ethylene oxide — carcinogen
+    ("2-methyloxirane",                     1),   # propylene oxide
+
+    # -- Aldehydes ------------------------------------------------------------
+    ("methanal",                            1),   # formaldehyde — carcinogen
+    ("ethanal",                             1),   # acetaldehyde — carcinogen
+    ("propanal",                            0),
+    ("butanal",                             0),
+    ("pentanal",                            0),
+    ("hexanal",                             0),
+    ("heptanal",                            0),
+    ("octanal",                             0),
+    ("nonanal",                             0),
+    ("decanal",                             0),
+    ("benzenecarbaldehyde",                        0),
+    ("furan-2-carbaldehyde",                       1),   # furfural
+    ("2-methylpropanal",                    0),
+    ("3-methylbutanal",                     0),
+    ("prop-2-enal",                         1),   # acrolein — toxic
+    ("but-2-enal",                          1),   # crotonaldehyde
+
+    # -- Ketones ---------------------------------------------------------------
+    ("propan-2-one",                        0),   # acetone
+    ("butan-2-one",                         0),   # MEK
+    ("pentan-2-one",                        0),
+    ("pentan-3-one",                        0),
+    ("hexan-2-one",                         1),   # neurotoxic
+    ("hexan-3-one",                         0),
+    ("heptan-2-one",                        0),
+    ("heptan-4-one",                        0),
+    ("octan-2-one",                         0),
+    ("cyclohexanone",                       0),
+    ("cyclopentanone",                      0),
+    ("cycloheptanone",                      0),
+    ("1-phenylethan-1-one",                 0),   # acetophenone systematic
+
+    # -- Carboxylic acids -----------------------------------------------------
+    ("methanoic acid",                      0),   # formic acid
+    ("ethanoic acid",                       0),   # acetic acid
+    ("propanoic acid",                      0),
+    ("butanoic acid",                       0),
+    ("pentanoic acid",                      0),
+    ("hexanoic acid",                       0),
+    ("heptanoic acid",                      0),
+    ("octanoic acid",                       0),
+    ("nonanoic acid",                       0),
+    ("decanoic acid",                       0),
+    ("2-methylpropanoic acid",              0),
+    ("3-methylbutanoic acid",               0),
+    ("2-ethylhexanoic acid",                0),
+    ("benzoic acid",                        0),
+    ("2-methylbenzoic acid",                0),
+    ("4-methylbenzoic acid",                0),
+    ("4-nitrobenzoic acid",                 1),
+    ("2-phenylacetic acid",                   0),
+    ("cyclohexanecarboxylic acid",          0),
+    ("prop-2-enoic acid",                      0),   # acrylic acid
+    ("2-methylprop-2-enoic acid",              0),   # methacrylic acid
+    ("(E)-but-2-enoic acid",                    0),   # crotonic acid
+    ("pent-4-enoic acid",                   0),
+
+    # -- Dicarboxylic acids ----------------------------------------------------
+    ("ethanedioic acid",                    0),   # oxalic acid
+    ("propanedioic acid",                   0),   # malonic acid
+    ("butanedioic acid",                    0),   # succinic acid
+    ("pentanedioic acid",                   0),   # glutaric acid
+    ("hexanedioic acid",                    0),   # adipic acid
+    ("heptanedioic acid",                   0),   # pimelic acid
+    ("octanedioic acid",                    0),   # suberic acid
+    ("nonanedioic acid",                    0),   # azelaic acid
+    ("decanedioic acid",                    0),   # sebacic acid
+    ("(E)-but-2-enedioic acid",                        0),   # (E)-butenedioic acid — retained
+    ("(Z)-but-2-enedioic acid",                         0),   # (Z)-butenedioic acid — retained
+
+    # -- Hydroxy acids ---------------------------------------------------------
+    ("2-hydroxypropanoic acid",                         0),   # 2-hydroxypropanoic — retained
+    ("2-hydroxybutanedioic acid",                          0),   # retained
+    ("(2R,3R)-2,3-dihydroxybutanedioic acid",                       0),   # retained
+    ("2-hydroxypropane-1,2,3-tricarboxylic acid",                         0),   # retained
+    ("2-hydroxyacetic acid",                       0),   # 2-hydroxyethanoic acid
+    ("2-hydroxy-2-phenylacetic acid",                       0),
+    ("2-hydroxybenzoic acid",                      0),   # 2-hydroxybenzoic — retained
+    ("2-oxopropanoic acid",                        0),   # 2-oxopropanoic — retained
+
+    # -- Amino acids (IUPAC retained trivial names) ----------------------------
+    ("2-aminoacetic acid",                             0),
+    ("(2S)-2-aminopropanoic acid",                             0),
+    ("(2S)-2-amino-3-methylbutanoic acid",                              0),
+    ("(2S)-2-amino-4-methylpentanoic acid",                             0),
+    ("(2S,3S)-2-amino-3-methylpentanoic acid",                          0),
+    ("(2S)-2-amino-3-hydroxypropanoic acid",                              0),
+    ("(2S,3R)-2-amino-3-hydroxybutanoic acid",                           0),
+    ("(2R)-2-amino-3-sulfanylpropanoic acid",                            0),
+    ("(2S)-2-amino-4-methylsulfanylbutanoic acid",                          0),
+    ("(2S)-pyrrolidine-2-carboxylic acid",                             0),
+    ("(2S)-2-amino-3-phenylpropanoic acid",                       0),
+    ("(2S)-2-amino-3-(4-hydroxyphenyl)propanoic acid",                            0),
+    ("(2S)-2-amino-3-(1H-indol-3-yl)propanoic acid",                          0),
+    ("(2S)-2-amino-3-(1H-imidazol-5-yl)propanoic acid",                           0),
+    ("(2S)-2,6-diaminohexanoic acid",                              0),
+    ("(2S)-2-amino-5-(diaminomethylideneamino)pentanoic acid",                            0),
+    ("(2S)-2,4-diamino-4-oxobutanoic acid",                          0),
+    ("(2S)-2,5-diamino-5-oxopentanoic acid",                           0),
+    ("(2S)-2-aminobutanedioic acid",                       0),
+    ("(2S)-2-aminopentanedioic acid",                       0),
+    ("(2S)-2,5-diaminopentanoic acid",                           0),
+    ("(2S)-2-amino-5-(carbamoylamino)pentanoic acid",                          0),
+    ("2-aminoethanesulfonic acid",                             0),
+    ("2-(trimethylazaniumyl)acetate",                             0),
+    ("3-hydroxy-4-(trimethylazaniumyl)butanoate",                           0),
+    ("2-[carbamimidoyl(methyl)amino]acetic acid",                            0),
+    ("(2S,4R)-4-hydroxypyrrolidine-2-carboxylic acid",                      0),
+
+    # -- Sugars (IUPAC retained trivial names) ---------------------------------
+    ("(3R,4S,5S,6R)-6-(hydroxymethyl)oxane-2,3,4,5-tetrol",                             0),
+    ("(3S,4R,5R)-2-(hydroxymethyl)oxane-2,3,4,5-tetrol",                            0),
+    ("(3R,4S,5R,6R)-6-(hydroxymethyl)oxane-2,3,4,5-tetrol",                           0),
+    ("(3S,4S,5S,6R)-6-(hydroxymethyl)oxane-2,3,4,5-tetrol",                             0),
+    ("(3R,4R,5R)-oxane-2,3,4,5-tetrol",                              0),
+    ("(3R,4S,5S)-oxane-2,3,4,5-tetrol",                           0),
+    ("(3R,4S,5R)-oxane-2,3,4,5-tetrol",                              0),
+    ("(3S,4R,5S,6S)-6-methyloxane-2,3,4,5-tetrol",                              0),
+    ("(3R,4R,5R,6S)-6-methyloxane-2,3,4,5-tetrol",                            0),
+    ("(3S,4S,5R)-2-(hydroxymethyl)oxane-2,3,4,5-tetrol",                            0),
+    ("(3R,4R,5R)-1,3,4,5,6-pentahydroxyhexan-2-one",                            0),
+    ("(3S,4R,5S)-2-(hydroxymethyl)oxane-2,3,4,5-tetrol",                             0),
+    ("(2R,3R,4S,5S,6R)-2-[(2S,3S,4S,5R)-3,4-dihydroxy-2,5-bis(hydroxymethyl)oxolan-2-yl]oxy-6-(hydroxymethyl)oxane-3,4,5-triol",                             0),
+    ("(2R,3R,4S,5R,6S)-2-(hydroxymethyl)-6-[(2R,3S,4R,5R)-4,5,6-trihydroxy-2-(hydroxymethyl)oxan-3-yl]oxyoxane-3,4,5-triol",                             0),
+    ("(2R,3S,4S,5R,6R)-2-(hydroxymethyl)-6-[(2R,3S,4R,5R)-4,5,6-trihydroxy-2-(hydroxymethyl)oxan-3-yl]oxyoxane-3,4,5-triol",                             0),
+    ("(2R,3S,4S,5R,6R)-2-(hydroxymethyl)-6-[(2R,3R,4S,5S,6R)-3,4,5-trihydroxy-6-(hydroxymethyl)oxan-2-yl]oxyoxane-3,4,5-triol",                           0),
+    ("(2R,3S,4S,5R,6S)-2-(hydroxymethyl)-6-[(2R,3S,4R,5R)-4,5,6-trihydroxy-2-(hydroxymethyl)oxan-3-yl]oxyoxane-3,4,5-triol",                          0),
+    ("(2R,3R,4R,5S)-hexane-1,2,3,4,5,6-hexol",                            0),
+    ("(2R,3R,4R,5R)-hexane-1,2,3,4,5,6-hexol",                            0),
+    ("(2R,4S)-pentane-1,2,3,4,5-pentol",                             0),
+    ("(2S,3R)-butane-1,2,3,4-tetrol",                          0),
+    ("cyclohexane-1,2,3,4,5,6-hexol",                            0),
+    ("(2S,3S,4S,5R)-3,4,5,6-tetrahydroxyoxane-2-carboxylic acid",                     0),
+
+    # -- Nucleobases -----------------------------------------------------------
+    ("7H-purin-6-amine",                             0),
+    ("2-amino-1,7-dihydropurin-6-one",                             0),
+    ("6-amino-1H-pyrimidin-2-one",                            0),
+    ("5-methyl-1H-pyrimidine-2,4-dione",                             0),
+    ("1H-pyrimidine-2,4-dione",                              0),
+    ("3,7-dihydropurine-2,6-dione",                            0),
+    ("1,7-dihydropurin-6-one",                        0),
+    ("7H-purine",                              0),
+
+    # -- Nitrogen compounds ----------------------------------------------------
+    ("carbonyl diamide",                                0),
+    ("methanamine",                         0),
+    ("ethanamine",                          0),
+    ("propan-1-amine",                      0),
+    ("propan-2-amine",                      0),
+    ("butan-1-amine",                       0),
+    ("butan-2-amine",                       0),
+    ("pentan-1-amine",                      0),
+    ("hexan-1-amine",                       0),
+    ("cyclohexanamine",                     0),
+    ("N-methylethanamine",                  0),
+    ("N,N-dimethylmethanamine",             0),
+    ("N-ethylethanamine",                   0),
+    ("N,N-diethylethanamine",               0),
+    ("benzenamine",                             1),
+    ("2-methylaniline",                     1),
+    ("3-methylaniline",                     1),
+    ("4-methylaniline",                     1),
+    ("4-chloroaniline",                     1),
+    ("4-nitroaniline",                      1),
+    ("N-phenylaniline",                       0),
+    ("phenylhydrazine",                     1),
+    ("nitrobenzene",                        1),
+    ("nitromethane",                        1),
+    ("1-nitroethane",                         0),
+    ("1-nitropropane",                      1),
+    ("2-nitropropane",                      1),
+    ("hydrazine",                           1),
+    ("methylhydrazine",                     1),
+    ("hydroxylamine",                       1),
+    ("methanamide",                           1),
+    ("ethanamide",                           0),
+    ("benzamide",                           0),
+    ("prop-2-enamide",                      1),   # acrylamide systematic
+
+    # -- Nitriles -------------------------------------------------------------
+    ("ethanenitrile",                        1),
+    ("propanenitrile",                       1),
+    ("butanenitrile",                       1),
+    ("pentanenitrile",                      0),
+    ("benzonitrile",                        0),
+    ("prop-2-enenitrile",                       1),
+
+    # -- Halogenated compounds -------------------------------------------------
+    ("chloromethane",                       1),
+    ("dichloromethane",                     1),
+    ("trichloromethane",                    1),
+    ("tetrachloromethane",                  1),
+    ("bromomethane",                        1),
+    ("iodomethane",                         1),
+    ("fluoromethane",                       1),
+    ("chloroethane",                        1),
+    ("bromoethane",                         1),
+    ("1,2-dichloroethane",                  1),
+    ("1,1-dichloroethane",                  1),
+    ("1,1,1-trichloroethane",               1),
+    ("1,1,2-trichloroethane",               1),
+    ("1,2-dibromoethane",                   1),
+    ("chloroethene",                        1),   # vinyl chloride
+    ("1,1-dichloroethene",                  1),
+    ("1,1,2-trichloroethene",                     1),
+    ("1,1,2,2-tetrachloroethene",                   1),
+    ("bromoethene",                         1),
+    ("chlorobenzene",                       1),
+    ("fluorobenzene",                       1),   # halogenated aromatic - CNS depressant, irritant
+    ("bromobenzene",                        1),
+    ("iodobenzene",                         1),
+    ("1,2-dichlorobenzene",                 1),
+    ("1,3-dichlorobenzene",                 1),
+    ("1,4-dichlorobenzene",                 1),
+    ("1,2,4-trichlorobenzene",              1),
+    ("1,2,3,4,5,6-hexachlorobenzene",                   1),
+    ("2,3,4,5,6-pentachlorophenol",                   1),
+    ("1-chloronaphthalene",                 1),
+    ("2-chloroethanol",                     1),
+    ("2-bromoethanol",                      1),
+    ("3-chloroprop-1-ene",                     1),   # allyl chloride
+
+    # -- Sulfur compounds ------------------------------------------------------
+    ("hydrogen sulfide",                    1),
+    ("carbon disulfide",                    1),
+    ("dimethyl sulfide",                    0),
+    ("dimethyl sulfoxide",                  0),
+    ("dimethyl sulfone",                    0),
+    ("methanesulfonic acid",                0),
+    ("ethanesulfonic acid",                 0),
+    ("benzenesulfonic acid",                1),   # strong acid, corrosive
+    ("thiophene",                           0),
+    ("thiolane",                            0),
+    ("thiane",                              0),
+
+    # -- Inorganic IUPAC names -------------------------------------------------
+    ("oxidane",                             0),   # water
+    ("sodium chloride",                     0),
+    ("potassium chloride",                  0),
+    ("calcium dichloride",                    0),
+    ("magnesium dichloride",                  0),
+    ("sodium bromide",                      0),
+    ("potassium bromide",                   0),
+    ("sodium iodide",                       0),
+    ("sodium fluoride",                     0),
+    ("sodium hydroxide",                    1),   # Cat 1A corrosive, severe burns
+    ("potassium hydroxide",                 1),
+    ("lithium hydroxide",                   1),
+    ("calcium oxide",                       0),
+    ("calcium hydroxide",                   0),
+    ("magnesium oxide",                     0),
+    ("magnesium hydroxide",                 0),
+    ("sodium carbonate",                    0),
+    ("potassium carbonate",                 0),
+    ("sodium hydrogen carbonate",           0),   # baking soda systematic
+    ("calcium carbonate",                   0),
+    ("barium sulfate",                      0),
+    ("barium chloride",                     1),
+    ("copper sulfate",                      1),
+    ("zinc chloride",                       1),
+    ("zinc oxide",                          0),
+    ("zinc sulfate",                        0),
+    ("iron(II) sulfate",                        0),
+    ("manganese dioxide",                   1),
+    ("chromium trioxide",                   1),
+    ("arsenic trioxide",                    1),
+    ("lead(II) oxide",                          1),
+    ("mercury(II) chloride",                    1),
+    ("nickel(II) chloride",                     1),
+    ("cobalt(II) chloride",                     1),
+    ("cadmium chloride",                    1),
+    ("thallium(I) chloride",                   1),
+    ("beryllium dichloride",                  1),
+    ("selenium dioxide",                    1),
+    ("vanadium pentoxide",                  1),
+    ("antimony trioxide",                   1),
+    ("bismuth(III) oxide",                       0),
+    ("silicon dioxide",                     0),
+    ("titanium dioxide",                    0),
+    ("aluminium oxide",                      0),
+    ("iron(III) oxide",                          0),
+    ("silver nitrate",                      1),
+    ("ammonium nitrate",                    1),
+    ("potassium nitrate",                   1),
+    ("sodium nitrate",                      1),   # oxidizer, methemoglobinemia (same hazard as KNO3)
+    ("sodium nitrite",                      1),
+    ("potassium chlorate",                  1),
+    ("sodium chlorate",                     1),
+
+    # -- Inorganic acids / gases -----------------------------------------------
+    ("sulfuric acid",                       1),
+    ("hydrochloric acid",                   1),
+    ("nitric acid",                         1),
+    ("phosphoric acid",                     0),
+    ("hydrofluoric acid",                   1),
+    ("perchloric acid",                     1),
+    ("hydrobromic acid",                    1),
+    ("carbonic acid",                       0),
+    ("carbon dioxide",                      0),
+    ("carbon monoxide",                     1),
+    ("nitrogen",                            0),
+    ("oxygen",                              0),
+    ("argon",                               0),
+    ("helium",                              0),
+    ("neon",                                0),
+    ("krypton",                             0),
+    ("xenon",                               0),
+    ("fluorine",                            1),
+    ("chlorine",                            1),
+    ("bromine",                             1),
+    ("ammonia",                             1),
+    ("nitrous oxide",                       0),
+    ("nitrogen dioxide",                    1),
+    ("sulfur dioxide",                      1),
+    ("sulfur trioxide",                     1),
+    ("hydrogen chloride",                   1),
+    ("hydrogen bromide",                    1),
+    ("hydrogen fluoride",                   1),
+    ("phosphane",                           1),
+    ("arsane",                              1),
+    ("silane",                              1),
+    ("borane",                            1),
+    ("stibane",                             1),
+    ("hydrogen cyanide",                    1),
+    ("dinitrogen tetroxide",                1),
+    ("sodium cyanide",                      1),
+    ("potassium cyanide",                   1),
+    ("carbononitridic chloride",                   1),
+    ("sodium azide",                        1),
+
+    # -- Phenolic / aromatic-O compounds ---------------------------------------
+    ("benzene-1,2-diol",                    1),   # catechol
+    ("benzene-1,3-diol",                    1),   # resorcinol - GHS acute tox Cat 4, endocrine disruptor
+    ("benzene-1,4-diol",                    1),   # hydroquinone
+    ("benzene-1,2,3-triol",                 1),
+    ("benzene-1,3,5-triol",                 1),   # phloroglucinol - irritant, GHS Cat 4
+    ("4-nitrophenol",                       1),
+    ("2-nitrophenol",                       1),
+    ("4-chlorophenol",                      1),
+    ("2-chlorophenol",                      1),
+
+    # -- Esters ---------------------------------------------------------------
+    ("methyl methanoate",                   0),
+    ("methyl ethanoate",                    0),
+    ("ethyl ethanoate",                     0),
+    ("propyl ethanoate",                    0),
+    ("butyl ethanoate",                     0),
+    ("pentyl ethanoate",                    0),
+    ("methyl propanoate",                   0),
+    ("ethyl propanoate",                    0),
+    ("methyl butanoate",                    0),
+    ("ethyl butanoate",                     0),
+    ("methyl benzoate",                     0),
+    ("ethyl benzoate",                      0),
+    ("phenyl ethanoate",                    0),
+    ("benzyl ethanoate",                    0),
+    ("dimethyl carbonate",                  0),
+    ("diethyl carbonate",                   0),
+    ("dimethyl oxalate",                    0),
+    ("diethyl oxalate",                     0),
+    ("dimethyl propanedioate",                   0),
+    ("diethyl propanedioate",                    0),
+    ("methyl 2-hydroxybenzoate",                   0),
+
+    # -- Heterocyclic amines ---------------------------------------------------
+    ("piperidine",                          0),
+    ("piperazine",                          0),
+    ("pyrrolidine",                         0),
+    ("azetidine",                           0),
+    ("morpholine",                          1),
+    ("aziridine",                           1),
+    ("pyridine",                            1),
+    ("2-methylpyridine",                    1),
+    ("3-methylpyridine",                    1),
+    ("4-methylpyridine",                    1),
+    ("2,6-dimethylpyridine",                1),
+    ("pyrimidine",                          0),
+    ("pyrazine",                            0),
+    ("pyridazine",                          0),
+    ("1,3,5-triazine",                      0),
+    ("quinoline",                           1),
+    ("isoquinoline",                        1),
+    ("acridine",                            1),
+    ("quinoxaline",                         0),
+    ("quinazoline",                         0),
+    ("1H-pyrrole",                             0),
+    ("1H-imidazole",                           0),
+    ("1H-1,2,4-triazole",                      0),
+    ("1,2,3-triazole",                      0),
+    ("1H-indole",                              0),
+    ("2,3-dihydro-1H-indole",                            0),
+    ("1H-benzimidazole",                       0),
+    ("1,3-benzoxazole",                         0),
+    ("1,3-benzothiazole",                       0),
+    ("1-benzofuran",                          0),
+    ("pteridine",                           0),
+    ("9H-xanthene",                            0),
+
+    # -- Vitamins (IUPAC retained) ---------------------------------------------
+    ("7,8-dimethyl-10-[(2S,3S,4R)-2,3,4,5-tetrahydroxypentyl]benzo[g]pteridine-2,4-dione",                          0),
+    ("2-[3-[(4-amino-2-methylpyrimidin-5-yl)methyl]-4-methyl-1,3-thiazol-3-ium-5-yl]ethanol",                            0),
+    ("5-[(3aS,4S,6aR)-2-oxo-1,3,3a,4,6,6a-hexahydrothieno[3,4-d]imidazol-4-yl]pentanoic acid",                              0),
+    ("pyridine-3-carboxylic acid",                              0),
+    ("(2E,4E,6E,8E)-3,7-dimethyl-9-(2,6,6-trimethylcyclohexen-1-yl)nona-2,4,6,8-tetraen-1-ol",                             0),
+    ("(1S,3Z)-3-[(2E)-2-[(1R,3aS,7aR)-1-[(E,2R,5R)-5,6-dimethylhept-3-en-2-yl]-7a-methyl-2,3,3a,5,6,7-hexahydro-1H-inden-4-ylidene]ethylidene]-4-methylidenecyclohexan-1-ol",                      0),
+    ("(1S,3Z)-3-[(2E)-2-[(1R,3aS,7aR)-7a-methyl-1-[(2R)-6-methylheptan-2-yl]-2,3,3a,5,6,7-hexahydro-1H-inden-4-ylidene]ethylidene]-4-methylidenecyclohexan-1-ol",                     1),   # rodenticide at mg doses, hypercalcemia
+    ("(2R)-2-[(1S)-1,2-dihydroxyethyl]-3,4-dihydroxy-2H-furan-5-one",                       0),
+    ("(2S)-2-[[4-[(2-amino-4-oxo-3H-pteridin-6-yl)methylamino]benzoyl]amino]pentanedioic acid",                          0),
+
+    # -- Terpenes / essential oil compounds (IUPAC retained or short systematic) -
+    ("1-methyl-4-prop-1-en-2-ylcyclohexene",                            0),
+    ("5-methyl-2-propan-2-ylcyclohexan-1-ol",                             0),
+    ("1,7,7-trimethylbicyclo[2.2.1]heptan-2-one",                             0),
+    ("5-methyl-2-propan-2-ylphenol",                              0),
+    ("2-methyl-5-prop-1-en-2-ylcyclohex-2-en-1-one",                             0),
+    ("1,7,7-trimethylbicyclo[2.2.1]heptan-2-ol",                             0),
+    ("(2E)-3,7-dimethylocta-2,6-dien-1-ol",                            0),
+    ("3,7-dimethylocta-1,6-dien-3-ol",                            0),
+    ("(2E)-3,7-dimethylocta-2,6-dienal",                              0),
+    ("2-methoxy-4-prop-2-enylphenol",                             0),
+    ("4-hydroxy-3-methoxybenzaldehyde",                            0),
+    ("(E)-3-phenylprop-2-enal",                      0),
+    ("chromen-2-one",                            0),
+    ("5-prop-2-enyl-1,3-benzodioxole",                             1),
+    ("1-methoxy-4-prop-2-enylbenzene",                           1),
+    ("(5R)-5-methyl-2-propan-2-ylidenecyclohexan-1-one",                            1),
+    ("2,6,6-trimethylbicyclo[3.1.1]hept-2-ene",                        0),
+    ("6,6-dimethyl-2-methylidenebicyclo[3.1.1]heptane",                         0),
+    ("7-methyl-3-methylideneocta-1,6-diene",                             0),
+    ("(2E,6E)-3,7,11-trimethyldodeca-2,6,10-trien-1-ol",                            0),
+    ("(2R)-6-methyl-2-[(1R)-4-methylcyclohex-3-en-1-yl]hept-5-en-2-ol",                           0),
+    ("(6E,10E,14E,18E)-2,6,10,15,19,23-hexamethyltetracosa-2,6,10,14,18,22-hexaene",                            0),
+    ("(3S,8S,9S,10R,13R,14S,17R)-10,13-dimethyl-17-[(2R)-6-methylheptan-2-yl]-2,3,4,7,8,9,11,12,14,15,16,17-dodecahydro-1H-cyclopenta[a]phenanthren-3-ol",                         0),
+    ("(3S,9S,10R,13R,14R,17R)-17-[(E,2R,5R)-5,6-dimethylhept-3-en-2-yl]-10,13-dimethyl-2,3,4,9,11,12,14,15,16,17-decahydro-1H-cyclopenta[a]phenanthren-3-ol",                          0),
+    ("(2E,4E)-5-(1,3-benzodioxol-5-yl)-1-piperidin-1-ylpenta-2,4-dien-1-one",                            0),
+
+    # -- Phenolics / flavonoids (IUPAC retained) -------------------------------
+    ("3,4,5-trihydroxybenzoic acid",                         0),
+    ("6,7,13,14-tetrahydroxy-2,9-dioxatetracyclo[6.6.2.04,16.011,15]hexadeca-1(15),4,6,8(16),11,13-hexaene-3,10-dione",                        0),
+    ("(E)-3-(3,4-dihydroxyphenyl)prop-2-enoic acid",                        0),
+    ("2-(3,4-dihydroxyphenyl)-3,5,7-trihydroxychromen-4-one",                           0),
+    ("3,5,7-trihydroxy-2-(4-hydroxyphenyl)chromen-4-one",                          0),
+    ("2-(3,4-dihydroxyphenyl)-5,7-dihydroxychromen-4-one",                            0),
+    ("5,7-dihydroxy-2-(4-hydroxyphenyl)chromen-4-one",                            0),
+    ("(2R,3S)-2-(3,4-dihydroxyphenyl)-3,4-dihydro-2H-chromene-3,5,7-triol",                            0),
+    ("5-[(E)-2-(4-hydroxyphenyl)ethenyl]benzene-1,3-diol",                         0),
+    ("(1E,6E)-1,7-bis(4-hydroxy-3-methoxyphenyl)hepta-1,6-diene-3,5-dione",                            0),
+    ("(E)-N-[(4-hydroxy-3-methoxyphenyl)methyl]-8-methylnon-6-enamide",                           0),
+    ("16,17-dimethoxy-5,7-dioxa-13-azoniapentacyclo[11.8.0.02,10.04,8.015,20]henicosa-1(13),2,4(8),9,14,16,18,20-octaene",                           0),
+
+    # -- Alkaloids (IUPAC retained trivial names) ------------------------------
+    ("(4R,4aR,7S,7aR,12bS)-3-methyl-2,4,4a,7,7a,13-hexahydro-1H-4,12-methanobenzofuro[3,2-e]isoquinoline-7,9-diol",                            1),   # fatal respiratory depression, narrow TI
+    ("(4R,4aR,7S,7aR,12bS)-9-methoxy-3-methyl-2,4,4a,7,7a,13-hexahydro-1H-4,12-methanobenzofuro[3,2-e]isoquinolin-7-ol",                             1),   # fatal in ultrarapid CYP2D6 metabolizers
+    ("(R)-[(2S,4S,5R)-5-ethenyl-1-azabicyclo[2.2.2]octan-2-yl]-(6-methoxyquinolin-4-yl)methanol",                             0),
+    ("[(1S,5R)-8-methyl-8-azabicyclo[3.2.1]octan-3-yl] 3-hydroxy-2-phenylpropanoate",                            0),
+    ("(3S,4R)-3-ethyl-4-[(3-methylimidazol-4-yl)methyl]oxolan-2-one",                         0),
+    ("1,3-dimethyl-7H-purine-2,6-dione",                        0),
+    ("3,7-dimethylpurine-2,6-dione",                         0),
+    ("(4aR,5aS,8aR,13aS,15aS,15bR)-4a,5,5a,7,8,13a,15,15a,15b,16-decahydro-2H-4,6-methanoindolo[3,2,1-ij]oxepino[2,3,4-de]pyrrolo[2,3-h]quinolin-14-one",                          1),
+    ("(4aR,5aS,8aR,13aS,15aS,15bR)-10,11-dimethoxy-4a,5,5a,7,8,13a,15,15a,15b,16-decahydro-2H-4,6-methanoindolo[3,2,1-ij]oxepino[2,3,4-de]pyrrolo[2,3-h]quinolin-14-one",                             1),
+    ("3-[(2S)-1-methylpyrrolidin-2-yl]pyridine",                            1),
+    ("methyl (1R,2R,3S,5S)-3-benzoyloxy-8-methyl-8-azabicyclo[3.2.1]octane-2-carboxylate",                             1),
+    ("N-[(7S)-1,2,3,10-tetramethoxy-9-oxo-6,7-dihydro-5H-benzo[a]heptalen-7-yl]acetamide",                          1),
+    ("[(1S,2R,3R,4R,5R,6S,7S,8R,9R,13R,14R,16S,17S,18R)-8-acetyloxy-11-ethyl-5,7,14-trihydroxy-6,16,18-trimethoxy-13-(methoxymethyl)-11-azahexacyclo[7.7.2.12,5.01,10.03,8.013,17]nonadecan-4-yl] benzoate",                           1),
+    ("(6aR,9R)-N-[(1S,2S,4R,7S)-7-benzyl-2-hydroxy-4-methyl-5,8-dioxo-3-oxa-6,9-diazatricyclo[7.3.0.02,6]dodecan-4-yl]-7-methyl-6,6a,8,9-tetrahydro-4H-indolo[4,3-fg]quinoline-9-carboxamide",                          1),
+    ("(2S)-2-propylpiperidine",                             1),
+    ("(1R,9S)-7,11-diazatricyclo[7.3.1.02,7]trideca-2,4-dien-6-one",                            1),
+    ("2-[(2R,6S)-6-[(2S)-2-hydroxy-2-phenylethyl]-1-methylpiperidin-2-yl]-1-phenylethanone",                            1),
+    ("(2R,3R,4R,5R,6S)-2-[(2R,3R,4S,5S,6R)-5-hydroxy-6-(hydroxymethyl)-2-[[(1S,2S,7S,10R,11S,14S,15R,16S,17R,20S,23S)-10,14,16,20-tetramethyl-22-azahexacyclo[12.10.0.02,11.05,10.015,23.017,22]tetracos-4-en-7-yl]oxy]-4-[(2S,3R,4S,5S,6R)-3,4,5-trihydroxy-6-(hydroxymethyl)oxan-2-yl]oxyoxan-3-yl]oxy-6-methyloxane-3,4,5-triol",                            1),
+    ("(2S,3R,4S,5S,6R)-2-[(2S,3R,4S,5R,6R)-2-[(2R,3R,4R,5R,6R)-4,5-dihydroxy-2-(hydroxymethyl)-6-[(1R,2S,4S,5'S,6S,7S,8R,9S,12S,13S,16S,18S)-5',7,9,13-tetramethylspiro[5-oxapentacyclo[10.8.0.02,9.04,8.013,18]icosane-6,2'-piperidine]-16-yl]oxyoxan-3-yl]oxy-5-hydroxy-6-(hydroxymethyl)-4-[(2S,3R,4S,5R)-3,4,5-trihydroxyoxan-2-yl]oxyoxan-3-yl]oxy-6-(hydroxymethyl)oxane-3,4,5-triol",                            1),
+    ("[(2S,4R,5S)-4-hydroxy-5-methyloxolan-2-yl]methyl-trimethylazanium",                           1),
+    ("5-(aminomethyl)-1,2-oxazol-3-one",                            1),
+    ("2-amino-2-(3-oxo-1,2-oxazol-5-yl)acetic acid",                       1),
+    ("24-methyl-5,7,18,20-tetraoxa-24-azoniahexacyclo[11.11.0.02,10.04,8.014,22.017,21]tetracosa-1(24),2,4(8),9,11,13,15,17(21),22-nonaene",                        1),
+    ("[3-[2-(dimethylamino)ethyl]-1H-indol-4-yl] dihydrogen phosphate",                          0),
+    ("2-(3,4,5-trimethoxyphenyl)ethanamine",                           0),
+
+    # -- Pesticides (IUPAC retained or abbreviated) ----------------------------
+    ("1-methyl-4-(1-methylpyridin-1-ium-4-yl)pyridin-1-ium",                            1),
+    ("7,10-diazoniatricyclo[8.4.0.02,7]tetradeca-1(14),2,4,6,10,12-hexaene",                              1),
+    ("6-chloro-4-N-ethyl-2-N-propan-2-yl-1,3,5-triazine-2,4-diamine",                            1),
+    ("6-chloro-2-N,4-N-diethyl-1,3,5-triazine-2,4-diamine",                            1),
+    ("diethyl 2-dimethoxyphosphinothioylsulfanylbutanedioate",                           1),
+    ("diethoxy-(6-methyl-2-propan-2-ylpyrimidin-4-yl)oxy-sulfanylidene-lambda5-phosphane",                            1),
+    ("diethoxy-(4-nitrophenoxy)-sulfanylidene-lambda5-phosphane",                           1),
+    ("2-(phosphonomethylamino)acetic acid",                          1),
+    ("(1S,6R,13S)-16,17-dimethoxy-6-prop-1-en-2-yl-2,7,20-trioxapentacyclo[11.8.0.03,11.04,8.014,19]henicosa-3(11),4(8),9,14,16,18-hexaen-12-one",                            1),
+    ("1,2,3,4,5,6-hexachlorocyclohexane",                             1),
+    ("(1R,2S,3S,6R,7R,8S,9S,11R)-3,4,5,6,13,13-hexachloro-10-oxapentacyclo[6.3.1.13,6.02,7.09,11]tridec-4-ene",                            1),
+    ("(1S,2S,3S,6R,7R,8R)-1,8,9,10,11,11-hexachlorotetracyclo[6.2.1.13,6.02,7]dodeca-4,9-diene",                              1),
+    ("(1R,2R,3R,6S,7S,8S,9S,11R)-3,4,5,6,13,13-hexachloro-10-oxapentacyclo[6.3.1.13,6.02,7.09,11]tridec-4-ene",                              1),
+    ("1,5,7,8,9,10,10-heptachlorotricyclo[5.2.1.02,6]deca-3,8-diene",                          1),
+    ("(1R,7S)-1,3,4,7,8,9,10,10-octachlorotricyclo[5.2.1.02,6]dec-8-ene",                           1),
+    ("1,9,10,11,12,12-hexachloro-4,6-dioxa-5lambda4-thiatricyclo[7.2.1.02,8]dodec-10-ene 5-oxide",                          1),
+    ("1,2,3,4,5,5,6,7,8,9,10,10-dodecachloropentacyclo[5.3.0.02,6.03,9.04,8]decane",                               1),
+    ("(2,2-dimethyl-3H-1-benzofuran-7-yl) N-methylcarbamate",                          1),
+    ("naphthalen-1-yl N-methylcarbamate",                            1),
+    ("[(E)-(2-methyl-2-methylsulfanylpropylidene)amino] N-methylcarbamate",                            1),
+    ("methyl N-(methylcarbamoyloxy)ethanimidothioate",                            1),
+    ("5-amino-1-[2,6-dichloro-4-(trifluoromethyl)phenyl]-4-(trifluoromethylsulfinyl)pyrazole-3-carbonitrile",                            1),
+    ("(NE)-N-[1-[(6-chloro-3-pyridinyl)methyl]imidazolidin-2-ylidene]nitramide",                        1),
+    ("1-[(2-chloro-1,3-thiazol-5-yl)methyl]-3-methyl-2-nitroguanidine",                        1),
+    ("(NE)-N-[3-[(2-chloro-1,3-thiazol-5-yl)methyl]-5-methyl-1,3,5-oxadiazinan-4-ylidene]nitramide",                        1),
+    ("2,6-dinitro-N,N-dipropyl-4-(trifluoromethyl)aniline",                         1),
+    ("3,4-dimethyl-2,6-dinitro-N-pentan-3-ylaniline",                       1),
+    ("3-(3,4-dichlorophenyl)-1,1-dimethylurea",                              1),
+    ("2-chloro-N-(2,6-diethylphenyl)-N-(methoxymethyl)acetamide",                            1),
+    ("diethoxy-sulfanylidene-[(3,5,6-trichloro-2-pyridinyl)oxy]-lambda5-phosphane",                        1),
+    ("2,2-dichloroethenyl dimethyl phosphate",                          1),
+    ("2-(trichloromethylsulfanyl)-3a,4,7,7a-tetrahydroisoindole-1,3-dione",                              1),
+    ("dimethylcarbamothioylsulfanyl N,N-dimethylcarbamodithioate",                              1),
+    ("2,4,5,6-tetrachlorobenzene-1,3-dicarbonitrile",                      1),
+    ("3-(3,5-dichlorophenyl)-5-ethenyl-5-methyl-1,3-oxazolidine-2,4-dione",                         1),
+    ("3-(3,5-dichlorophenyl)-2,4-dioxo-N-propan-2-ylimidazolidine-1-carboxamide",                           1),
+    ("diethoxy-(ethylsulfanylmethylsulfanyl)-sulfanylidene-lambda5-phosphane",                             1),
+    ("tert-butylsulfanylmethylsulfanyl-diethoxy-sulfanylidene-lambda5-phosphane",                            1),
+    ("ethoxy-ethyl-phenylsulfanyl-sulfanylidene-lambda5-phosphane",                             1),
+
+    # -- Biochemical metabolites -----------------------------------------------
+    ("7,9-dihydro-3H-purine-2,6,8-trione",                           0),
+    ("2-amino-3-methyl-4H-imidazol-5-one",                          0),
+    ("2-hydroxyethyl(trimethyl)azanium",                             0),
+    ("4-(2-aminoethyl)benzene-1,2-diol",                            0),
+    ("3-(2-aminoethyl)-1H-indol-5-ol",                           0),
+    ("2-(1H-imidazol-5-yl)ethanamine",                           0),
+    ("4-[(1R)-1-hydroxy-2-(methylamino)ethyl]benzene-1,2-diol",                         0),
+    ("4-[(1R)-2-amino-1-hydroxyethyl]benzene-1,2-diol",                      0),
+    ("N-[2-(5-methoxy-1H-indol-3-yl)ethyl]acetamide",                           0),
+
+    # -- Additional toxicants --------------------------------------------------
+    ("4-[2-(4-hydroxyphenyl)propan-2-yl]phenol",                         1),
+    ("5-chloro-2-(2,4-dichlorophenoxy)phenol",                           1),
+    ("2-nonylphenol",                         1),
+    ("tributylstannane",                         1),
+    ("diazomethane",                        1),
+    ("pentanedial",                         1),   # glutaraldehyde systematic
+    ("2-chloroacetaldehyde",                  1),
+    ("2-chloroethanol",                     1),   # dup — first kept
+    ("phthalic acid",                       0),
+    ("benzene-1,3-dicarboxylic acid",                    0),
+    ("terephthalic acid",                   0),
+
+    # -- Additional pharmaceuticals (IUPAC retained or generic INN that is IUPAC-accepted) -
+    ("3-(diaminomethylidene)-1,1-dimethylguanidine",                           0),
+    ("4-hydroxy-3-(3-oxo-1-phenylbutyl)chromen-2-one",                            1),   # Cat 1 acute toxicant, teratogen, rodenticide
+    ("cis-(1R,2R)-2-[(dimethylamino)methyl]-1-(3-methoxyphenyl)cyclohexan-1-ol",                            0),
+    ("2-(2-chlorophenyl)-2-(methylamino)cyclohexan-1-one",                            0),
+    ("2-(diethylamino)-N-(2,6-dimethylphenyl)acetamide",                           0),
+    ("8-chloro-6-(2-fluorophenyl)-1-methyl-4H-imidazo[1,5-a][1,4]benzodiazepine",                           0),
+    ("7-chloro-1-methyl-5-phenyl-3H-1,4-benzodiazepin-2-one",                            0),
+    ("8-chloro-1-methyl-6-phenyl-4H-[1,2,4]triazolo[4,3-a][1,4]benzodiazepine",                          0),
+    ("7-chloro-5-(2-chlorophenyl)-3-hydroxy-1,3-dihydro-1,4-benzodiazepin-2-one",                           0),
+    ("5-(2-chlorophenyl)-7-nitro-1,3-dihydro-1,4-benzodiazepin-2-one",                          0),
+    ("4-[4-(4-chlorophenyl)-4-hydroxypiperidin-1-yl]-1-(4-fluorophenyl)butan-1-one",                         0),
+    ("N-methyl-3-phenyl-3-[4-(trifluoromethyl)phenoxy]propan-1-amine",                          0),
+    ("(1S,4S)-4-(3,4-dichlorophenyl)-N-methyl-1,2,3,4-tetrahydronaphthalen-1-amine",                          0),
+    ("(4R,4aS,7aR,12bS)-4a,9-dihydroxy-3-prop-2-enyl-2,4,5,6,7a,13-hexahydro-1H-4,12-methanobenzofuro[3,2-e]isoquinolin-7-one",                            0),
+    ("6-(dimethylamino)-4,4-diphenylheptan-3-one",                           0),
+    ("2,6-di(propan-2-yl)phenol",                            0),
+    ("6-methoxy-2-[(4-methoxy-3,5-dimethyl-2-pyridinyl)methylsulfinyl]-1H-benzimidazole",                          0),
+    ("N-(4-hydroxyphenyl)acetamide",                         0),   # IUPAC retained in pharm
+    ("2-[4-(2-methylpropyl)phenyl]propanoic acid",                           0),   # INN accepted as IUPAC trivial
+    ("(2S)-2-(6-methoxynaphthalen-2-yl)propanoic acid",                            0),
+    ("1-[4-(2-methoxyethyl)phenoxy]-3-(propan-2-ylamino)propan-2-ol",                          0),
+    ("2-[4-[2-hydroxy-3-(propan-2-ylamino)propoxy]phenyl]acetamide",                            0),
+    ("3-O-ethyl 5-O-methyl 2-(2-aminoethoxymethyl)-4-(2-chlorophenyl)-6-methyl-1,4-dihydropyridine-3,5-dicarboxylate",                          0),
+    ("4-chloro-2-(furan-2-ylmethylamino)-5-sulfamoylbenzoic acid",                          0),
+    ("S-[(7R,8R,9S,10R,13S,14S,17R)-10,13-dimethyl-3,5'-dioxospiro[2,6,7,8,9,11,12,14,15,16-decahydro-1H-cyclopenta[a]phenanthrene-17,2'-oxolane]-7-yl] ethanethioate",                      0),
+    ("3-[(3S,5R,8R,9S,10S,12R,13S,14S,17R)-3-[(2R,4S,5S,6R)-5-[(2S,4S,5S,6R)-5-[(2S,4S,5S,6R)-4,5-dihydroxy-6-methyloxan-2-yl]oxy-4-hydroxy-6-methyloxan-2-yl]oxy-4-hydroxy-6-methyloxan-2-yl]oxy-12,14-dihydroxy-10,13-dimethyl-1,2,3,4,5,6,7,8,9,11,12,15,16,17-tetradecahydrocyclopenta[a]phenanthren-17-yl]-2H-furan-5-one",                             1),   # narrow TI, fatal cardiac arrhythmias
+    ("1,5-dihydropyrazolo[5,4-d]pyrimidin-4-one",                         0),
+    ("N-[(7S)-1,2,3,10-tetramethoxy-9-oxo-6,7-dihydro-5H-benzo[a]heptalen-7-yl]acetamide",                          1),   # dup — first occurrence kept
+    ("cisplatin",                           1),
+    ("N,N-bis(2-chloroethyl)-2-oxo-1,3,2lambda5-oxazaphosphinan-2-amine",                    1),
+    ("(2S)-2-[[4-[(2,4-diaminopteridin-6-yl)methyl-methylamino]benzoyl]amino]pentanedioic acid",                        1),   # cytotoxic, teratogenic, hepatotoxic
+    ("methyl (1R,9R,10S,11R,12R,19R)-11-acetyloxy-12-ethyl-4-[(13S,15S,17S)-17-ethyl-17-hydroxy-13-methoxycarbonyl-1,11-diazatetracyclo[13.3.1.04,12.05,10]nonadeca-4(12),5,7,9-tetraen-13-yl]-8-formyl-10-hydroxy-5-methoxy-8,16-diazapentacyclo[10.6.1.01,9.02,7.016,19]nonadeca-2,4,6,13-tetraene-10-carboxylate",                         1),
+    ("2-(2,6-dioxopiperidin-3-yl)isoindole-1,3-dione",                         1),
+    ("N-(4-ethoxyphenyl)acetamide",                          1),
+
+    # -- Extended alkenes / alkynes (toxic only) -------------------------------
+    ("cyclopenta-1,3-diene",                     1),
+    ("(3E)-penta-1,3-diene",                      1),
+    ("prop-2-yn-1-ol",                      1),   # propargyl alcohol
+
+    # -- Extended PAHs ---------------------------------------------------------
+    ("coronene",                            1),
+    ("perylene",                            1),
+    ("benzo[a]pyrene",                      1),
+    ("benzo[a]anthracene",                  1),
+    ("pentacyclo[10.7.1.02,7.08,20.013,18]icosa-1(19),2(7),3,5,8(20),9,11,13,15,17-decaene",                1),
+    ("benzo[k]fluoranthene",                1),
+    ("naphtho[1,2-b]phenanthrene",               1),
+
+    # -- Extended alcohols (toxic only) -----------------------------------------
+    ("furan-2-ylmethanol",                  1),   # furfuryl alcohol
+    ("4-tert-butylphenol",                  1),   # endocrine disruptor
+
+    # -- Extended ethers (toxic only) ------------------------------------------
+    ("2-methoxyethanol",                    1),   # cellosolve
+    ("2-ethoxyethanol",                     1),
+    ("2-methyloxolane",             1),
+
+    # -- Extended aldehydes (toxic only) ---------------------------------------
+    ("(E)-hex-2-enal",                          1),
+    ("4-nitrobenzaldehyde",                 1),
+
+
+
+    # -- Extended carboxylic acids ---------------------------------------------
+    # -- Extended carboxylic acids (selected) ----------------------------------
+    ("dodecanoic acid",                     0),
+    ("tetradecanoic acid",                  0),
+    ("hexadecanoic acid",                   0),
+    ("octadecanoic acid",                   0),
+    ("4-hydroxybenzoic acid",               0),
+    ("3-hydroxybenzoic acid",               0),
+    ("3-nitrobenzoic acid",                 1),
+
+    # -- Lactones --------------------------------------------------------------
+    # -- Lactones (toxic only) ---------------------------------------------------
+    ("oxetan-2-one",                        1),   # β-propiolactone
+    ("oxolan-2-one",                        1),   # γ-butyrolactone
+
+    # -- Lactams (toxic only) -----------------------------------------------------
+    ("azepan-2-one",                        1),   # ε-caprolactam
+    ("1-methylpyrrolidin-2-one",            1),   # N-methylpyrrolidone
+    ("aziridin-2-one",                      1),   # aziridone
+
+    # -- Imides (toxic only) ----------------------------------------------------
+    ("1H-pyrrole-2,5-dione",                1),   # maleimide
+
+    # -- Anhydrides (toxic only) -----------------------------------------------
+    ("acetyl acetate",                  1),   # acetic anhydride
+    ("furan-2,5-dione",                     1),   # maleic anhydride
+
+    # -- Extended heterocycles -------------------------------------------------
+    # -- Extended heterocycles (toxic only) --------------------------------------
+    ("acridin-9-amine",                     1),   # 9-aminoacridine
+    ("5-methyl-1H-imidazole",                   1),
+    ("2-methyl-1H-benzimidazole",               1),
+    ("2-methylpyridine",                    1),   # dup handled
+
+    # -- Carbamates ------------------------------------------------------------
+    ("methyl carbamate",                    1),
+    ("ethyl carbamate",                     1),   # urethane
+
+    # -- Organophosphorus ------------------------------------------------------
+    ("trimethyl phosphate",                 1),
+    ("tributyl phosphate",                  1),
+    ("triphenyl phosphate",                 1),
+
+    # -- Extended sulfur compounds ---------------------------------------------
+    ("butane-1-thiol",                      1),
+    ("benzenethiol",                        1),
+    ("4-methylbenzenethiol",                1),
+
+    # -- Extended halogenated compounds ----------------------------------------
+    ("1,2-dichloropropane",                 1),
+    ("1,2,3-trichloropropane",              1),
+    ("1,1,1,2,2,2-hexachloroethane",                    1),
+    ("fluoroform",                    0),   # HFC-23
+    ("1,1,1,2,2,2-hexafluoroethane",                    0),   # HFC-116
+    ("1,1,1,2-tetrafluoroethane",           0),   # HFC-134a
+    ("1,2-difluorobenzene",                 1),   # halogenated aromatic, irritant
+    ("1,3-difluorobenzene",                 1),   # halogenated aromatic, irritant
+    ("1,4-difluorobenzene",                 1),   # halogenated aromatic, irritant
+    ("1-chloro-2-methylbenzene",            1),
+    ("1-chloro-4-methylbenzene",            1),
+    ("1-fluoro-2-methylbenzene",            1),   # halogenated aromatic, irritant
+    ("1-fluoro-4-methylbenzene",            1),   # halogenated aromatic, irritant
+    ("4-fluorobenzaldehyde",                0),
+    ("4-chlorobenzaldehyde",                1),
+    ("3-fluorobenzaldehyde",                0),
+    ("2-fluoroethanol",                     1),   # very toxic
+    ("bromomethylbenzene",                  1),   # benzyl bromide
+    ("chloromethylbenzene",                 1),   # benzyl chloride
+    ("2,4-dichlorophenol",                  1),
+    ("2,6-dichlorophenol",                  1),
+    ("3,4-dichlorophenol",                  1),
+
+    # -- Extended nitriles -----------------------------------------------------
+    # -- Extended nitriles (toxic only) -------------------------------------------
+    # (no additional non-dup toxic nitriles)
+
+    # -- Extended amides (toxic only) -----------------------------------------
+    ("N,N-dimethylformamide",             1),   # DMF
+    ("N,N-dimethylacetamide",              1),   # DMAc
+    ("2-chloroacetamide",                   1),
+
+    # -- Additional inorganic (toxic only) -------------------------------------
+    ("potassium permanganate",              1),
+    ("sodium dichromate",                   1),
+    ("potassium dichromate",                1),
+    ("ammonium fluoride",                   1),
+    ("boric acid",                          1),
+    ("potassium bromate",                   1),
+    ("sodium fluorosilicate",               1),
+    ("iron(III) chloride",                       1),   # ferric chloride
+    ("tin(II) chloride",                        1),
+    ("lead(II) chloride",                       1),
+
+
+    # -- Additional pharmaceuticals --------------------------------------------
+    ("1,3,7-trimethylpurine-2,6-dione",                            0),
+    ("1,3-dimethyl-7H-purine-2,6-dione",                        0),   # duplicate handled
+    ("2-acetyloxybenzoic acid",                0),   # aspirin IUPAC retained
+    ("N-(4-hydroxyphenyl)acetamide",                         0),   # duplicate handled
+    ("4-aminobenzenesulfonamide",                       0),
+    ("4-amino-N-pyridin-2-ylbenzenesulfonamide",                       1),
+    ("4-amino-N-(1,3-thiazol-2-yl)benzenesulfonamide",                       0),
+    ("2-(diethylamino)ethyl 4-aminobenzoate",                            0),
+    ("ethyl 4-aminobenzoate",                          0),
+    ("3-(2-chlorophenothiazin-10-yl)-N,N-dimethylpropan-1-amine",                      0),
+    ("3-chloro-6-(4-methylpiperazin-1-yl)-11H-benzo[b][1,4]benzodiazepine",                           0),
+    ("3-[2-[4-(6-fluoro-1,2-benzoxazol-3-yl)piperidin-1-yl]ethyl]-2-methyl-6,7,8,9-tetrahydropyrido[1,2-a]pyrimidin-4-one",                         0),
+    ("2-methyl-4-(4-methylpiperazin-1-yl)-10H-thieno[2,3-b][1,5]benzodiazepine",                          0),
+    ("2-[2-(4-benzo[b][1,4]benzothiazepin-6-ylpiperazin-1-yl)ethoxy]ethanol",                          0),
+    ("7-[4-[4-(2,3-dichlorophenyl)piperazin-1-yl]butoxy]-3,4-dihydro-1H-quinolin-2-one",                        0),
+    ("lithium carbonate",                   0),
+    ("benzo[b][1]benzazepine-11-carboxamide",                       0),
+    ("2-propylpentanoic acid",                       0),
+    ("6-(2,3-dichlorophenyl)-1,2,4-triazine-3,5-diamine",                         0),
+    ("(2S)-2-(2-oxopyrrolidin-1-yl)butanamide",                       0),
+    ("2-[1-(aminomethyl)cyclohexyl]acetic acid",                          0),
+    ("(3S)-3-(aminomethyl)-5-methylhexanoic acid",                          0),
+    ("[(1R,2S,6S,9R)-4,4,11,11-tetramethyl-3,5,7,10,12-pentaoxatricyclo[7.3.0.02,6]dodecan-6-yl]methyl sulfamate",                          0),
+    ("1-[2-(dimethylamino)-1-(4-methoxyphenyl)ethyl]cyclohexan-1-ol",                         0),
+    ("5-methyl-2,5,19-triazatetracyclo[13.4.0.02,7.08,13]nonadeca-1(15),8,10,12,16,18-hexaene",                         0),
+    ("2-(tert-butylamino)-1-(3-chlorophenyl)propan-1-one",                           0),
+    ("1-[3-(dimethylamino)propyl]-1-(4-fluorophenyl)-3H-2-benzofuran-5-carbonitrile",                          1),   # QT prolongation, cardiotoxic in overdose
+    ("(1S)-1-[3-(dimethylamino)propyl]-1-(4-fluorophenyl)-3H-2-benzofuran-5-carbonitrile",                        0),   # safer than citalopram in overdose
+    ("(3S,4R)-3-(1,3-benzodioxol-5-yloxymethyl)-4-(4-fluorophenyl)piperidine",                          0),
+    ("N,N-dimethyl-3-(2-tricyclo[9.4.0.03,8]pentadeca-1(15),3,5,7,11,13-hexaenylidene)propan-1-amine",                       1),   # lethal TCA overdose, narrow TI
+    ("3-(5,6-dihydrobenzo[b][1]benzazepin-11-yl)-N,N-dimethylpropan-1-amine",                          1),
+    ("N-methyl-3-(2-tricyclo[9.4.0.03,8]pentadeca-1(15),3,5,7,11,13-hexaenylidene)propan-1-amine",                       0),
+    ("3-(2-chloro-5,6-dihydrobenzo[b][1]benzazepin-11-yl)-N,N-dimethylpropan-1-amine",                        1),
+    ("3-(6H-benzo[c][1]benzoxepin-11-ylidene)-N,N-dimethylpropan-1-amine",                             0),
+    ("4-chloro-N-(2-morpholin-4-ylethyl)benzamide",                         0),
+    ("2-phenylcyclopropan-1-amine",                     1),
+    ("2-phenylethylhydrazine",                          1),
+    ("2-[(1-benzylpiperidin-4-yl)methyl]-5,6-dimethoxy-2,3-dihydroinden-1-one",                           0),
+    ("[3-[(1S)-1-(dimethylamino)ethyl]phenyl] N-ethyl-N-methylcarbamate",                        0),
+    ("3,5-dimethyladamantan-1-amine",                           0),
+    ("1,2,3,4-tetrahydroacridin-9-amine",                             1),
+    ("5-[2-ethoxy-5-(4-methylpiperazin-1-yl)sulfonylphenyl]-1-methyl-3-propyl-6H-pyrazolo[4,5-d]pyrimidin-7-one",                          0),
+    ("(2R,8R)-2-(1,3-benzodioxol-5-yl)-6-methyl-3,6,17-triazatetracyclo[8.7.0.03,8.011,16]heptadeca-1(10),11,13,15-tetraene-4,7-dione",                           0),
+    ("2-[2-ethoxy-5-(4-ethylpiperazin-1-yl)sulfonylphenyl]-5-methyl-7-propyl-3H-imidazo[5,1-f][1,2,4]triazin-4-one",                          0),
+    ("(1S,3aS,3bS,5aR,9aR,9bS,11aS)-N-tert-butyl-9a,11a-dimethyl-7-oxo-1,2,3,3a,3b,4,5,5a,6,9b,10,11-dodecahydroindeno[5,4-f]quinoline-1-carboxamide",                         0),
+    ("5-[(2R)-2-[2-(2-ethoxyphenoxy)ethylamino]propyl]-2-methoxybenzenesulfonamide",                          0),
+    ("[4-(4-amino-6,7-dimethoxyquinazolin-2-yl)piperazin-1-yl]-(2,3-dihydro-1,4-benzodioxin-3-yl)methanone",                           0),
+    ("[4-(4-amino-6,7-dimethoxyquinazolin-2-yl)piperazin-1-yl]-(oxolan-2-yl)methanone",                           0),
+    ("[4-(4-amino-6,7-dimethoxyquinazolin-2-yl)piperazin-1-yl]-(furan-2-yl)methanone",                            0),
+    ("N-(2,6-dichlorophenyl)-4,5-dihydro-1H-imidazol-2-amine",                           1),
+    ("N-(diaminomethylidene)-2-(2,6-dichlorophenyl)acetamide",                          0),
+    ("(2S)-2-amino-3-(3,4-dihydroxyphenyl)-2-methylpropanoic acid",                          0),
+    ("phthalazin-1-ylhydrazine",                         1),
+    ("3-hydroxy-2-imino-6-piperidin-1-ylpyrimidin-4-amine",                           1),
+    ("(2S)-1-[(2S)-2-methyl-3-sulfanylpropanoyl]pyrrolidine-2-carboxylic acid",                           0),
+    ("(2S)-1-[(2S)-2-[[(2S)-1-ethoxy-1-oxo-4-phenylbutan-2-yl]amino]propanoyl]pyrrolidine-2-carboxylic acid",                           0),
+    ("(2S)-1-[(2S)-6-amino-2-[[(1S)-1-carboxy-3-phenylpropyl]amino]hexanoyl]pyrrolidine-2-carboxylic acid",                          0),
+    ("(2S,3aS,6aS)-1-[(2S)-2-[[(2S)-1-ethoxy-1-oxo-4-phenylbutan-2-yl]amino]propanoyl]-3,3a,4,5,6,6a-hexahydro-2H-cyclopenta[b]pyrrole-2-carboxylic acid",                            0),
+    ("[2-butyl-5-chloro-3-[[4-[2-(2H-tetrazol-5-yl)phenyl]phenyl]methyl]imidazol-4-yl]methanol",                            0),
+    ("(2S)-3-methyl-2-[pentanoyl-[[4-[2-(2H-tetrazol-5-yl)phenyl]phenyl]methyl]amino]butanoic acid",                           0),
+    ("2-butyl-3-[[4-[2-(2H-tetrazol-5-yl)phenyl]phenyl]methyl]-1,3-diazaspiro[4.4]non-1-en-4-one",                          0),
+    ("2-ethoxy-3-[[4-[2-(2H-tetrazol-5-yl)phenyl]phenyl]methyl]benzimidazole-4-carboxylic acid",                         0),
+    ("dimethyl 2,6-dimethyl-4-(2-nitrophenyl)-1,4-dihydropyridine-3,5-dicarboxylate",                          0),
+    ("2-(3,4-dimethoxyphenyl)-5-[2-(3,4-dimethoxyphenyl)ethyl-methylamino]-2-propan-2-ylpentanenitrile",                           0),
+    ("[(2S,3S)-5-[2-(dimethylamino)ethyl]-2-(4-methoxyphenyl)-4-oxo-2,3-dihydro-1,5-benzothiazepin-3-yl] acetate",                           0),
+    ("3-(diaminomethylidene)-1,1-dimethylguanidine",                           0),   # duplicate handled
+    ("5-chloro-N-[2-[4-(cyclohexylcarbamoylsulfamoyl)phenyl]ethyl]-2-methoxybenzamide",                       0),
+    ("N-[2-[4-(cyclohexylcarbamoylsulfamoyl)phenyl]ethyl]-5-methylpyrazine-2-carboxamide",                           0),
+    ("(2R,3R,4R,5R)-4-[(2R,3R,4R,5S,6R)-5-[(2R,3R,4S,5S,6R)-3,4-dihydroxy-6-methyl-5-[[(1S,4R,5S,6S)-4,5,6-trihydroxy-3-(hydroxymethyl)cyclohex-2-en-1-yl]amino]oxan-2-yl]oxy-3,4-dihydroxy-6-(hydroxymethyl)oxan-2-yl]oxy-2,3,5,6-tetrahydroxyhexanal",                            0),
+    ("(2S)-2-amino-3-[4-(4-hydroxy-3,5-diiodophenoxy)-3,5-diiodophenyl]propanoic acid",                       0),
+    ("ethyl 3-methyl-2-sulfanylideneimidazole-1-carboxylate",                         0),
+    ("6-propyl-2-sulfanylidene-1H-pyrimidin-4-one",                    0),
+    ("(8S,9S,10R,11S,13S,14S,17R)-11,17-dihydroxy-17-(2-hydroxyacetyl)-10,13-dimethyl-7,8,9,11,12,14,15,16-octahydro-6H-cyclopenta[a]phenanthren-3-one",                        0),
+    ("(8S,9R,10S,11S,13S,14S,16R,17R)-9-fluoro-11,17-dihydroxy-17-(2-hydroxyacetyl)-10,13,16-trimethyl-6,7,8,11,12,14,15,16-octahydrocyclopenta[a]phenanthren-3-one",                       0),
+    ("(1S,2S,4R,8S,9S,11S,12S,13R)-11-hydroxy-8-(2-hydroxyacetyl)-9,13-dimethyl-6-propyl-5,7-dioxapentacyclo[10.8.0.02,9.04,8.013,18]icosa-14,17-dien-16-one",                          0),
+    ("S-(fluoromethyl) (6S,8S,9R,10S,11S,13S,14S,16R,17R)-6,9-difluoro-11,17-dihydroxy-10,13,16-trimethyl-3-oxo-6,7,8,11,12,14,15,16-octahydrocyclopenta[a]phenanthrene-17-carbothioate",                         1),
+    ("(8S,9R,10S,11S,13S,14S,16S,17R)-9-chloro-11,17-dihydroxy-17-(2-hydroxyacetyl)-10,13,16-trimethyl-6,7,8,11,12,14,15,16-octahydrocyclopenta[a]phenanthren-3-one",                       1),
+    ("(8S,9S,10R,11S,13S,14S,17R)-11,17-dihydroxy-17-(2-hydroxyacetyl)-10,13-dimethyl-2,6,7,8,9,11,12,14,15,16-decahydro-1H-cyclopenta[a]phenanthren-3-one",                      0),
+    ("(8S,9R,10S,11S,13S,14S,17R)-9-fluoro-11,17-dihydroxy-17-(2-hydroxyacetyl)-10,13-dimethyl-1,2,6,7,8,11,12,14,15,16-decahydrocyclopenta[a]phenanthren-3-one",                     0),
+    ("(2S,5R,6R)-6-[[(2R)-2-amino-2-(4-hydroxyphenyl)acetyl]amino]-3,3-dimethyl-7-oxo-4-thia-1-azabicyclo[3.2.0]heptane-2-carboxylic acid",                         0),
+    ("(2S,5R,6R)-6-[[(2R)-2-amino-2-phenylacetyl]amino]-3,3-dimethyl-7-oxo-4-thia-1-azabicyclo[3.2.0]heptane-2-carboxylic acid",                          0),
+    ("(2S,5R,6R)-6-[[(2R)-2-carboxy-2-thiophen-3-ylacetyl]amino]-3,3-dimethyl-7-oxo-4-thia-1-azabicyclo[3.2.0]heptane-2-carboxylic acid",                         0),
+    ("(6R,7R)-7-[[(2R)-2-amino-2-phenylacetyl]amino]-3-methyl-8-oxo-5-thia-1-azabicyclo[4.2.0]oct-2-ene-2-carboxylic acid",                          0),
+    ("(6R,7R)-3-[(5-methyl-1,3,4-thiadiazol-2-yl)sulfanylmethyl]-8-oxo-7-[[2-(tetrazol-1-yl)acetyl]amino]-5-thia-1-azabicyclo[4.2.0]oct-2-ene-2-carboxylic acid",                           0),
+    ("(6R,7R)-7-[[(2Z)-2-(2-amino-1,3-thiazol-4-yl)-2-methoxyiminoacetyl]amino]-3-[(2-methyl-5,6-dioxo-1H-1,2,4-triazin-3-yl)sulfanylmethyl]-8-oxo-5-thia-1-azabicyclo[4.2.0]oct-2-ene-2-carboxylic acid",                         0),
+    ("2-[4,6-diamino-3-[3-amino-6-[1-(methylamino)ethyl]oxan-2-yl]oxy-2-hydroxycyclohexyl]oxy-5-methyl-4-(methylamino)oxane-3,5-diol",                          1),
+    ("(2S,3R,4S,5S,6R)-4-amino-2-[(1S,2S,3R,4S,6R)-4,6-diamino-3-[(2R,3R,5S,6R)-3-amino-6-(aminomethyl)-5-hydroxyoxan-2-yl]oxy-2-hydroxycyclohexyl]oxy-6-(hydroxymethyl)oxane-3,5-diol",                          1),
+    ("(4S,4aR,5S,5aR,6R,12aR)-4-(dimethylamino)-1,5,10,11,12a-pentahydroxy-6-methyl-3,12-dioxo-4a,5,5a,6-tetrahydro-4H-tetracene-2-carboxamide",                         0),
+    ("(4S,4aS,5aS,6S,12aR)-4-(dimethylamino)-1,6,10,11,12a-pentahydroxy-6-methyl-3,12-dioxo-4,4a,5,5a-tetrahydrotetracene-2-carboxamide",                        0),
+    ("(3R,4S,5S,6R,7R,9R,11R,12R,13S,14R)-6-[(2S,3R,4S,6R)-4-(dimethylamino)-3-hydroxy-6-methyloxan-2-yl]oxy-14-ethyl-7,12,13-trihydroxy-4-[(2R,4R,5S,6S)-5-hydroxy-4-methoxy-4,6-dimethyloxan-2-yl]oxy-3,5,7,9,11,13-hexamethyl-oxacyclotetradecane-2,10-dione",                        0),
+    ("(2R,3S,4R,5R,8R,10R,11R,12S,13S,14R)-11-[(2S,3R,4S,6R)-4-(dimethylamino)-3-hydroxy-6-methyloxan-2-yl]oxy-2-ethyl-3,4,10-trihydroxy-13-[(2R,4R,5S,6S)-5-hydroxy-4-methoxy-4,6-dimethyloxan-2-yl]oxy-3,5,6,8,10,12,14-heptamethyl-1-oxa-6-azacyclopentadecan-15-one",                        0),
+    ("(3R,4S,5S,6R,7R,9R,11R,12R,13S,14R)-6-[(2S,3R,4S,6R)-4-(dimethylamino)-3-hydroxy-6-methyloxan-2-yl]oxy-14-ethyl-12,13-dihydroxy-4-[(2R,4R,5S,6S)-5-hydroxy-4-methoxy-4,6-dimethyloxan-2-yl]oxy-7-methoxy-3,5,7,9,11,13-hexamethyl-oxacyclotetradecane-2,10-dione",                      0),
+    ("(1S,2R,18R,19R,22S,25R,28R,40S)-48-[(2S,3R,4S,5S,6R)-3-[(2S,4S,5S,6S)-4-amino-5-hydroxy-4,6-dimethyloxan-2-yl]oxy-4,5-dihydroxy-6-(hydroxymethyl)oxan-2-yl]oxy-22-(2-amino-2-oxoethyl)-5,15-dichloro-2,18,32,35,37-pentahydroxy-19-[[(2R)-4-methyl-2-(methylamino)pentanoyl]amino]-20,23,26,42,44-pentaoxo-7,13-dioxa-21,24,27,41,43-pentazaoctacyclo[26.14.2.23,6.214,17.18,12.129,33.010,25.034,39]pentaconta-3,5,8(48),9,11,14,16,29(45),30,32,34(39),35,37,46,49-pentadecaene-40-carboxylic acid",                          1),
+    ("[(7S,9E,11S,12R,13S,14R,15R,16R,17S,18S,19E,21Z)-2,15,17,27,29-pentahydroxy-11-methoxy-3,7,12,14,16,18,22-heptamethyl-26-[(E)-(4-methylpiperazin-1-yl)iminomethyl]-6,23-dioxo-8,30-dioxa-24-azatetracyclo[23.3.1.14,7.05,28]triaconta-1(29),2,4,9,19,21,25,27-octaen-13-yl] acetate",                          1),
+    ("pyridine-4-carbohydrazide",                           1),
+    ("(2S)-2-[2-[[(2S)-1-hydroxybutan-2-yl]amino]ethylamino]butan-1-ol",                          0),
+    ("pyrazine-2-carboxamide",                        1),
+    ("2-amino-9-(2-hydroxyethoxymethyl)-1H-purin-6-one",                           0),
+    ("2-amino-9-(1,3-dihydroxypropan-2-yloxymethyl)-1H-purin-6-one",                         1),
+    ("1-[(2R,4S,5S)-4-azido-5-(hydroxymethyl)oxolan-2-yl]-5-methylpyrimidine-2,4-dione",                          1),
+    ("4-amino-1-[(2R,5S)-2-(hydroxymethyl)-1,3-oxathiolan-5-yl]pyrimidin-2-one",                          0),
+    ("[(2R)-1-(6-aminopurin-9-yl)propan-2-yl]oxymethylphosphonic acid",                           0),
+    ("(4S)-6-chloro-4-(2-cyclopropylethynyl)-4-(trifluoromethyl)-1H-3,1-benzoxazin-2-one",                           1),
+    ("(2S)-N-[(2S,4S,5S)-5-[[2-(2,6-dimethylphenoxy)acetyl]amino]-4-hydroxy-1,6-diphenylhexan-2-yl]-3-methyl-2-(2-oxo-1,3-diazinan-1-yl)butanamide",                           0),
+    ("1,3-thiazol-5-ylmethyl N-[(2S,3S,5S)-3-hydroxy-5-[[(2S)-3-methyl-2-[[methyl-[(2-propan-2-yl-1,3-thiazol-4-yl)methyl]carbamoyl]amino]butanoyl]amino]-1,6-diphenylhexan-2-yl]carbamate",                           0),
+    ("2-(2,4-difluorophenyl)-1,3-bis(1,2,4-triazol-1-yl)propan-2-ol",                         0),
+    ("2-butan-2-yl-4-[4-[4-[4-[[(2R,4S)-2-(2,4-dichlorophenyl)-2-(1,2,4-triazol-1-ylmethyl)-1,3-dioxolan-4-yl]methoxy]phenyl]piperazin-1-yl]phenyl]-1,2,4-triazol-3-one",                        0),
+    ("(1R,3S,5R,6R,9R,11R,15S,16R,17R,18S,19E,21E,23E,25E,27E,29E,31E,33R,35S,36R,37S)-33-[(2R,3S,4S,5S,6R)-4-amino-3,5-dihydroxy-6-methyloxan-2-yl]oxy-1,3,5,6,9,11,17,37-octahydroxy-15,16,18-trimethyl-13-oxo-14,39-dioxabicyclo[33.3.1]nonatriaconta-19,21,23,25,27,29,31-heptaene-36-carboxylic acid",                        1),
+    ("(1S,15S,16R,17R,18S,19E,21E,25E,27E,29E,31E)-33-[(2S,3S,4S,5S,6R)-4-amino-3,5-dihydroxy-6-methyloxan-2-yl]oxy-1,3,4,7,9,11,17,37-octahydroxy-15,16,18-trimethyl-13-oxo-14,39-dioxabicyclo[33.3.1]nonatriaconta-19,21,25,27,29,31-hexaene-36-carboxylic acid",                            0),
+    ("2-(2-methyl-5-nitroimidazol-1-yl)ethanol",                       1),
+    ("1-(2-ethylsulfonylethyl)-2-methyl-5-nitroimidazole",                          0),
+    ("4-N-(7-chloroquinolin-4-yl)-1-N,1-N-diethylpentane-1,4-diamine",                         1),
+    ("2-[4-[(7-chloroquinolin-4-yl)amino]pentyl-ethylamino]ethanol",                  0),
+    ("4-N-(6-methoxyquinolin-8-yl)pentane-1,4-diamine",                          1),
+    ("(1R,4S,5R,8S,9R,12S,13R)-1,5,9-trimethyl-11,14,15,16-tetraoxatetracyclo[10.3.1.04,13.08,13]hexadecan-10-one",                         0),
+    ("methyl N-(6-propylsulfanyl-1H-benzimidazol-2-yl)carbamate",                         0),
+    ("methyl N-(6-benzoyl-1H-benzimidazol-2-yl)carbamate",                         0),
+    ("2-(cyclohexanecarbonyl)-3,6,7,11b-tetrahydro-1H-pyrazino[2,1-a]isoquinolin-4-one",                        0),
+    ("5-(4-chlorophenyl)-6-ethylpyrimidine-2,4-diamine",                       1),
+    ("4-[4-(4-chlorophenyl)-4-hydroxypiperidin-1-yl]-N,N-dimethyl-2,2-diphenylbutanamide",                          0),
+    ("9-methyl-3-[(2-methylimidazol-1-yl)methyl]-2,3-dihydro-1H-carbazol-4-one",                         0),
+    ("4-amino-5-chloro-N-[2-(diethylamino)ethyl]-2-methoxybenzamide",                      1),
+    ("6-chloro-3-[1-[3-(2-oxo-3H-benzimidazol-1-yl)propyl]piperidin-4-yl]-1H-benzimidazol-2-one",                         0),
+    ("(E)-1-N'-[2-[[5-[(dimethylamino)methyl]furan-2-yl]methylsulfanyl]ethyl]-1-N-methyl-2-nitroethene-1,1-diamine",                          1),   # NDMA impurity issue
+    ("1-cyano-2-methyl-3-[2-[(5-methyl-1H-imidazol-4-yl)methylsulfanyl]ethyl]guanidine",                          0),
+    ("3-[[2-(diaminomethylideneamino)-1,3-thiazol-4-yl]methylsulfanyl]-N'-sulfamoylpropanimidamide",                          0),
+    ("6-(difluoromethoxy)-2-[(3,4-dimethoxy-2-pyridinyl)methylsulfinyl]-1H-benzimidazole",                        0),
+    ("2-[[3-methyl-4-(2,2,2-trifluoroethoxy)-2-pyridinyl]methylsulfinyl]-1H-benzimidazole",                        0),
+    ("6-methoxy-2-[(S)-(4-methoxy-3,5-dimethyl-2-pyridinyl)methylsulfinyl]-1H-benzimidazole",                        0),
+    ("methyl 7-[(1R,2R,3R)-3-hydroxy-2-[(E)-4-hydroxy-4-methyloct-1-enyl]-5-oxocyclopentyl]heptanoate",                         1),   # abortifacient
+    ("(3R,5R)-7-[2-(4-fluorophenyl)-3-phenyl-4-(phenylcarbamoyl)-5-propan-2-ylpyrrol-1-yl]-3,5-dihydroxyheptanoic acid",                        0),
+    ("[(1S,3R,7S,8S,8aR)-8-[2-[(2R,4R)-4-hydroxy-6-oxooxan-2-yl]ethyl]-3,7-dimethyl-1,2,3,7,8,8a-hexahydronaphthalen-1-yl] 2,2-dimethylbutanoate",                         0),
+    ("(3R,5R)-7-[(1S,2S,6S,8S,8aR)-6-hydroxy-2-methyl-8-[(2S)-2-methylbutanoyl]oxy-1,2,6,7,8,8a-hexahydronaphthalen-1-yl]-3,5-dihydroxyheptanoic acid",                         0),
+    ("(E,3R,5S)-7-[4-(4-fluorophenyl)-2-[methyl(methylsulfonyl)amino]-6-propan-2-ylpyrimidin-5-yl]-3,5-dihydroxyhept-6-enoic acid",                        0),
+    ("propan-2-yl 2-[4-(4-chlorobenzoyl)phenoxy]-2-methylpropanoate",                         0),
+    ("5-(2,5-dimethylphenoxy)-2,2-dimethylpentanoic acid",                         0),
+    ("4-hydroxy-3-(3-oxo-1-phenylbutyl)chromen-2-one",                            0),   # duplicate handled
+    ("2-acetyloxybenzoic acid",                             0),   # common name — retained IUPAC  
+    ("methyl (2S)-2-(2-chlorophenyl)-2-(6,7-dihydro-4H-thieno[3,2-c]pyridin-5-yl)acetate",                         0),
+    ("3-[[2-[(4-carbamimidoylanilino)methyl]-1-methylbenzimidazole-5-carbonyl]-pyridin-2-ylamino]propanoic acid",                          0),
+    ("5-chloro-N-[[(5S)-2-oxo-3-[4-(3-oxomorpholin-4-yl)phenyl]-1,3-oxazolidin-5-yl]methyl]thiophene-2-carboxamide",                         0),
+    ("1-(4-methoxyphenyl)-7-oxo-6-[4-(2-oxopiperidin-1-yl)phenyl]-4,5-dihydropyrazolo[5,4-c]pyridine-3-carboxamide",                            0),
+    ("3-[(3S,5R,8R,9S,10S,12R,13S,14S,17R)-3-[(2R,4S,5S,6R)-5-[(2S,4S,5S,6R)-5-[(2S,4S,5S,6R)-4,5-dihydroxy-6-methyloxan-2-yl]oxy-4-hydroxy-6-methyloxan-2-yl]oxy-4-hydroxy-6-methyloxan-2-yl]oxy-12,14-dihydroxy-10,13-dimethyl-1,2,3,4,5,6,7,8,9,11,12,15,16,17-tetradecahydrocyclopenta[a]phenanthren-17-yl]-2H-furan-5-one",                             0),   # duplicate handled
+    ("(2-butyl-1-benzofuran-3-yl)-[4-[2-(diethylamino)ethoxy]-3,5-diiodophenyl]methanone",                          1),
+    ("N-(piperidin-2-ylmethyl)-2,5-bis(2,2,2-trifluoroethoxy)benzamide",                          0),
+    ("N-[4-[1-hydroxy-2-(propan-2-ylamino)ethyl]phenyl]methanesulfonamide",                             0),
+    ("1-(propan-2-ylamino)-3-[4-(2-propan-2-yloxyethoxymethyl)phenoxy]propan-2-ol",                          0),
+    ("1-(9H-carbazol-4-yloxy)-3-[2-(2-methoxyphenoxy)ethylamino]propan-2-ol",                          0),
+    ("4-[2-(tert-butylamino)-1-hydroxyethyl]-2-(hydroxymethyl)phenol",                          0),   # albuterol
+    ("2-[2-[4-[(4-chlorophenyl)-phenylmethyl]piperazin-1-yl]ethoxy]acetic acid",                          0),
+    ("ethyl 4-(13-chloro-4-azatricyclo[9.4.0.03,8]pentadeca-1(11),3(8),4,6,12,14-hexaen-2-ylidene)piperidine-1-carboxylate",                          0),
+    ("2-[4-[1-hydroxy-4-[4-[hydroxy(diphenyl)methyl]piperidin-1-yl]butyl]phenyl]-2-methylpropanoic acid",                        0),
+    ("3-(4-chlorophenyl)-N,N-dimethyl-3-pyridin-2-ylpropan-1-amine",                      0),
+    ("N,N-dimethyl-1-phenothiazin-10-ylpropan-2-amine",                        1),
+    ("2-benzhydryloxy-N,N-dimethylethanamine",                     0),
+    ("(1S,9S,10S)-4-methoxy-17-methyl-17-azatetracyclo[7.5.3.01,10.02,7]heptadeca-2(7),3,5-triene",                    1),   # abuse potential
+    ("(4R,4aR,7S,7aR,12bS)-9-methoxy-3-methyl-2,4,4a,7,7a,13-hexahydro-1H-4,12-methanobenzofuro[3,2-e]isoquinolin-7-ol",                             0),   # duplicate handled
+    ("cis-(1R,2R)-2-[(dimethylamino)methyl]-1-(3-methoxyphenyl)cyclohexan-1-ol",                            0),   # duplicate handled
+    ("2-[2-(2,6-dichloroanilino)phenyl]acetic acid",                          0),
+    ("2-[1-(4-chlorobenzoyl)-5-methoxy-2-methylindol-3-yl]acetic acid",                        1),
+    ("4-[5-(4-methylphenyl)-3-(trifluoromethyl)pyrazol-1-yl]benzenesulfonamide",                           0),
+    ("4-hydroxy-2-methyl-1,1-dioxo-N-pyridin-2-yl-1lambda6,2-benzothiazine-3-carboxamide",                           0),
+    ("4-hydroxy-2-methyl-N-(5-methyl-1,3-thiazol-2-yl)-1,1-dioxo-1lambda6,2-benzothiazine-3-carboxamide",                           0),
+    ("5-benzoyl-2,3-dihydro-1H-pyrrolizine-1-carboxylic acid",                           0),
+    ("2-(2,3-dimethylanilino)benzoic acid",                      1),
+    ("zinc oxide",                          0),   # dup handled
+    ("2-phenoxyethanol",                      1),
+
+    # -- Extended terpenes / natural products ---------------------------------
+    # -- Extended terpenes (selected toxic) --------------------------------------
+    ("(3S,3aS,5aS,9bS)-3,5a,9-trimethyl-3a,4,5,9b-tetrahydro-3H-benzo[g][1]benzofuran-2,8-dione",                            1),
+    ("(1S,2R,6S,7R)-2,6-dimethyl-4,10-dioxatricyclo[5.2.1.02,6]decane-3,5-dione",                         1),
+
+    # -- Extended flavonoids / polyphenols -------------------------------------
+    ("prop-2-enal",                            1),   # prop-2-enal systematic dup
+    ("methyl prop-2-enoate",                     1),
+    ("ethyl prop-2-enoate",                      1),
+    ("butyl prop-2-enoate",                      1),
+    ("methyl 2-methylprop-2-enoate",                 1),
+    ("ethenyl acetate",                       1),
+    ("chloroethene",                      1),   # chloroethene dup handled
+    ("3-chloroprop-1-ene",                      1),   # 3-chloropropene dup handled
+    ("2-methyloxirane",                     1),   # 2-methyloxirane dup handled
+    ("2-(chloromethyl)oxirane",                     1),   # 2-(chloromethyl)oxirane
+    ("oxirane",                      1),   # oxirane dup handled
+    ("2-phenyloxirane",                       1),   # 2-phenyloxirane
+    ("prop-2-enamide",                          1),   # prop-2-enamide dup handled
+    ("dimethyl sulfate",                    1),
+    ("diethyl sulfate",                     1),
+    ("2-methoxy-2-methylpropane",             0),   # MTBE
+    ("N,N-dimethylnitrous amide",              1),   # NDMA — Tox
+    ("N,N-diethylnitrous amide",               1),   # NDEA
+    ("N,N-dimethyl-4-phenyldiazenylaniline",           1),   # butter yellow
+    ("4-phenylaniline",                     1),
+    ("naphthalen-2-amine",                     1),
+    ("naphthalen-1-amine",                     1),
+    ("4-phenyldiazenylaniline",                   1),
+    ("4-nitroso-N-phenylaniline",              1),
+    ("4-(4-aminophenyl)aniline",                           1),
+    ("4-(4-amino-3-methylphenyl)-2-methylaniline",               1),
+    ("N-(9H-fluoren-2-yl)acetamide",               1),
+    ("4-(4-amino-3-methoxyphenyl)-2-methoxyaniline",                       1),   # 3,3-dimethoxybenzidine
+    ("pyren-1-amine",                       1),
+    ("formaldehyde",                        1),   # methanal dup handled
+    ("acetaldehyde",                        1),   # ethanal dup handled
+    ("oxaldehyde",                             1),   # ethanedial
+    ("2-oxopropanal",                       1),
+    ("N,N-dimethylformamide",                   1),   # DMF dup handled
+    ("1-methylpyrrolidin-2-one",              1),   # 1-methylpyrrolidin-2-one dup
+    # (creosote and coal tar removed - complex mixtures, not single molecules)
+
+    # -- Food additives (selected) -----------------------------------------
+    ("(2E,4E)-hexa-2,4-dienoic acid",                         0),
+    ("propyl 3,4,5-trihydroxybenzoate",                      0),
+    ("cyclohexylsulfamic acid",                           1),
+    ("1,1-dioxo-1,2-benzothiazol-3-one",                           0),
+
+    # -- More inorganic / elemental --------------------------------------------
+    ("ozone",                               1),
+    ("hydrogen peroxide",                   1),
+    ("sodium peroxide",                     1),
+    ("sulfuric acid",                       1),   # dup handled
+    ("sulfurochloridic acid",                 1),
+    ("sulfurofluoridic acid",                 1),
+    ("2,4,6,8,9,10-hexaoxa-1lambda5,3lambda5,5lambda5,7lambda5-tetraphosphatricyclo[3.3.1.13,7]decane 1,3,5,7-tetraoxide",           1),   # P4O10 — corrosive
+    ("dinitrogen oxide",                    1),   # N2O — abuse/asphyxiant
+    ("trifluoro-lambda3-chlorane",                1),
+    ("trifluoro-lambda3-bromane",                 1),
+    ("tetrachlorosilane",               1),
+    ("tetrachlorotitanium",              1),
+    ("trifluoroborane",                   1),
+    ("trichloroalumane",                   1),
+    ("trichlorophosphane",              1),
+    ("pentachloro-lambda5-phosphane",            1),
+    ("phosphoryl trichloride",              1),
+    ("sulfuryl dichloride",                   1),
+    ("thionyl dichloride",                    1),
+
+    # -- New toxic: nitrosamines -----------------------------------------------
+    ("4-nitrosomorpholine",                 1),
+    ("1-nitrosopiperidine",                 1),
+    ("1-nitrosopyrrolidine",                1),
+    ("1-methyl-1-nitrosourea",              1),
+
+    # -- New toxic: reactive halides / isocyanates -----------------------------
+    ("methylimino(oxo)methane",                   1),   # Bhopal disaster agent
+    ("carbonyl dichloride",                 1),   # phosgene
+    ("sulfanylidenemethanone",                    1),
+    ("1-chloropropan-2-one",                       1),
+    ("2-chloroacetonitrile",                  1),
+    ("2-chloroacetyl chloride",               1),
+    ("benzoyl chloride",                    1),
+    ("acetyl chloride",                     1),
+    ("oxalyl dichloride",                     1),
+    ("methyl methanesulfonate",             1),   # mutagen
+    ("ethyl methanesulfonate",              1),   # mutagen / carcinogen
+    ("oxiran-2-ylmethanol",                            1),
+    ("2-(prop-2-enoxymethyl)oxirane",                1),
+    ("chloro(chloromethoxy)methane",              1),   # BCME — carcinogen
+    ("isocyanatobenzene",                   1),
+    ("2,4-diisocyanato-1-methylbenzene",                1),
+    ("5-isocyanato-1-(isocyanatomethyl)-1,3,3-trimethylcyclohexane",             1),
+    ("1,6-diisocyanatohexane",          1),
+
+    # -- New toxic: aromatic nitro / halophenols --------------------------------
+    ("1,3-dinitrobenzene",                  1),
+    ("1,4-dinitrobenzene",                  1),
+    ("1-methyl-2,4-dinitrobenzene",                  1),
+    ("2-methyl-1,3-dinitrobenzene",                  1),
+    ("2-methyl-1,3,5-trinitrobenzene",               1),   # TNT
+    ("2,4,6-trichlorophenol",               1),
+    ("2,4,5-trichlorophenol",               1),
+    ("3,5-dinitrophenol",                   1),
+    ("1-chloro-2,4-dinitrobenzene",         1),   # potent allergen/mutagen
+
+    # -- New toxic: additional aromatic amines ---------------------------------
+    ("4-fluoroaniline",                     1),
+    ("4-nitroquinoline",                    1),
+    ("2-nitro-9H-fluorene",                     1),
+    ("1-nitropyrene",                       1),
+    ("2-nitronaphthalene",                  1),
+    ("1-nitronaphthalene",                  1),
+
+    # -- New toxic: PCBs -------------------------------------------------------
+    ("1-chloro-4-phenylbenzene",                    1),
+    ("1-chloro-3-phenylbenzene",                    1),
+    ("1-chloro-2-phenylbenzene",                    1),
+    ("5,5-dichloro-1-phenylcyclohexa-1,3-diene",                1),
+    ("5,5-dichloro-2-phenylcyclohexa-1,3-diene",                1),
+
+    # -- New toxic: quinones ---------------------------------------------------
+    ("cyclohexa-2,5-diene-1,4-dione",                        1),   # 1,4-benzoquinone
+    ("cyclohexa-3,5-diene-1,2-dione",                    1),
+    ("naphthalene-1,4-dione",                      1),
+
+    # -- New toxic: halomethanes / haloethanes ---------------------------------
+    ("dibromomethane",                      1),
+    ("bromoform",                     1),   # bromoform
+    ("bromo(dichloro)methane",                1),
+    ("dibromo(chloro)methane",                1),
+    ("1,1-dibromoethane",                   1),
+    ("1,2-dibromopropane",                  1),
+    ("1,3-dibromopropane",                  1),
+    ("1,4-dibromobutane",                   1),
+    ("trichloro(nitro)methane",               1),   # chloropicrin
+
+    # -- New toxic: halogenated arenes -----------------------------------------
+    ("1,2,3-trichlorobenzene",              1),
+    ("1,3,5-trichlorobenzene",              1),
+    ("2,4-dichloroaniline",                 1),
+    ("3,4-dichloroaniline",                 1),
+    ("fluoroethene",                      1),   # carcinogen
+
+    # -- New toxic: heavy metal compounds -------------------------------------
+    ("lead sulfate",                        1),
+    ("lead carbonate",                      1),
+    ("lead nitrate",                        1),
+    ("lead(II) acetate",                        1),
+    ("cadmium sulfate",                     1),
+    ("cadmium(II) oxide",                       1),
+    ("cadmium acetate",                     1),
+    ("nickel sulfate",                      1),
+    ("nickel(II) oxide",                        1),
+    ("cobalt sulfate",                      1),
+    ("cobalt(II,III) oxide",                        1),
+    ("chromic acid",                        1),
+    ("potassium chromate",                  1),
+    ("trichloroarsane",                 1),
+    ("diarsenic pentoxide",                   1),
+    ("mercury(II) oxide",                       1),
+    ("mercury nitrate",                     1),
+    ("thallium sulfate",                    1),
+    ("thallium nitrate",                    1),
+    ("osmium tetroxide",                    1),
+    ("chromyl chloride",                    1),
+    ("uranium dioxide",                     1),
+    ("beryllium oxide",                     1),
+    ("beryllium sulfate",                   1),
+    ("lead(II) sulfide",                        1),
+
+    # -- New toxic: corrosive acids --------------------------------------------
+    ("2,2,2-trifluoroacetic acid",                1),
+    ("3-isothiocyanatoprop-1-ene",                1),
+    ("methyl isothiocyanate",               1),
+
+    # -- New toxic: mycotoxins / natural toxins --------------------------------
+    ("4-hydroxy-4,6-dihydrofuro[3,2-c]pyran-2-one",                             1),
+    ("(4S,12E)-16,18-dihydroxy-4-methyl-3-oxabicyclo[12.4.0]octadeca-1(14),12,15,17-tetraene-2,8-dione",                         1),
+    ("(1R,2R,3S,7R,9R,10R,12S)-3,10-dihydroxy-2-(hydroxymethyl)-1,5-dimethylspiro[8-oxatricyclo[7.2.1.02,7]dodec-5-ene-12,2'-oxirane]-4-one",                      1),
+    ("furo[3,2-g]chromen-7-one",                            1),
+    ("9-methoxyfuro[3,2-g]chromen-7-one",                   1),
+
+    # -- New toxic: cytotoxic / genotoxic pharmaceuticals ----------------------
+    ("[(4S,6S,7R,8S)-11-amino-7-methoxy-12-methyl-10,13-dioxo-2,5-diazatetracyclo[7.4.0.02,7.04,6]trideca-1(9),11-dien-8-yl]methyl carbamate",                           1),
+    ("6-(3-methyl-5-nitroimidazol-4-yl)sulfanyl-7H-purine",                        1),
+    ("3,7-dihydropurine-6-thione",                    1),
+    ("5-fluoro-1H-pyrimidine-2,4-dione",                        1),
+    ("4-methylsulfonyloxybutyl methanesulfonate",                            1),
+    ("4-[4-[bis(2-chloroethyl)amino]phenyl]butanoic acid",                        1),
+    ("(2S)-2-amino-3-[4-[bis(2-chloroethyl)amino]phenyl]propanoic acid",                           1),
+    ("1,3-bis(2-chloroethyl)-1-nitrosourea",                          1),
+    ("1-(2-chloroethyl)-3-cyclohexyl-1-nitrosourea",                           1),
+    ("3-methyl-4-oxoimidazo[5,1-d][1,2,3,5]tetrazine-8-carboxamide",                        1),
+    ("4-[(E)-dimethylaminodiazenyl]-1H-imidazole-5-carboxamide",                         1),
+    ("1-methyl-1-nitroso-3-[(2S,3R,4R,5S,6R)-2,4,5-trihydroxy-6-(hydroxymethyl)oxan-3-yl]urea",                      1),
+
+    # -- New toxic: PFAS / persistent pollutants -------------------------------
+    ("2,2,3,3,4,4,5,5,6,6,7,7,8,8,8-pentadecafluorooctanoic acid",              1),   # PFOA
+    ("1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,8-heptadecafluorooctane-1-sulfonic acid",           1),   # PFOS
+
+    # -- New toxic: industrial solvents / intermediates ------------------------
+    ("2-(2-hydroxyethoxy)ethanol",                   1),   # antifreeze toxin
+    ("5-(hydroxymethyl)furan-2-carbaldehyde",               1),
+    ("1-chloro-2-(2-chloroethoxy)ethane",             1),   # BCEE — carcinogen
+    ("acridine-3,6-diamine",                          1),   # intercalating mutagen
+    ("dibromomethane",                      1),   # dup handled
+]
+
+
+def build_dataset(max_tokens: int = 300, show_dropped: bool = False):
+    """Load tokenizer, count tokens, filter, write CSV."""
+    from toxguard.tokenizer import get_tokenizer
+
+    print(f"Loading IUPAC SentencePiece tokenizer from:\n  {SPM_PATH}")
+    if not os.path.exists(SPM_PATH):
+        print("ERROR: SPM model not found. Check iupacGPT installation path.")
+        sys.exit(1)
+    tokenizer = get_tokenizer(vocab_path=SPM_PATH)
+
+    # Deduplicate (first occurrence wins)
+    seen: set = set()
+    unique = []
+    for name, label in CANDIDATES:
+        key = name.strip().lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append((name.strip(), int(label)))
+
+    print(f"Candidate pool  : {len(unique)} unique IUPAC names")
+
+    # Tokenize and filter
+    kept, dropped = [], []
+    for name, label in unique:
+        ids = tokenizer(name)["input_ids"]
+        n_tok = len(ids)
+        if 1 <= n_tok <= max_tokens:
+            kept.append((name, label, n_tok))
+        else:
+            dropped.append((name, label, n_tok))
+
+    n_toxic = sum(1 for _, t, _ in kept if t == 1)
+    n_safe  = sum(1 for _, t, _ in kept if t == 0)
+
+    print(f"\nToken filter     : 1 – {max_tokens} tokens (inclusive)")
+    print(f"  Kept           : {len(kept):>5}  (toxic={n_toxic}, non-toxic={n_safe})")
+    print(f"  Dropped        : {len(dropped):>5}  (token count outside range)")
+
+    if show_dropped and dropped:
+        print("\nDropped molecules (token counts):")
+        for name, _, n in sorted(dropped, key=lambda x: x[2], reverse=True):
+            print(f"    [{n:>3} tok]  {name}")
+
+    # Token-count distribution
+    from collections import Counter
+    dist = Counter(n for _, _, n in kept)
+    print("\nToken-count distribution of kept molecules:")
+    for tok in sorted(dist):
+        bar = "█" * (dist[tok] // 3)
+        print(f"  {tok:>2} tokens : {dist[tok]:>4}  {bar}")
+
+    out_path = os.path.join(DATA_DIR, "common_molecules_raw.csv")
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["iupac_name", "is_toxic", "token_count"])
+        for name, label, n_tok in kept:
+            writer.writerow([name, label, n_tok])
+
+    print(f"\nSaved → {out_path}")
+    return out_path
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Build common_molecules_raw.csv")
+    parser.add_argument(
+        "--max_tokens", type=int, default=300,
+        help="Maximum number of SPM tokens allowed (default: 300)"
+    )
+    parser.add_argument(
+        "--show_dropped", action="store_true",
+        help="Print all dropped molecules and their token counts"
+    )
+    args = parser.parse_args()
+    build_dataset(max_tokens=args.max_tokens, show_dropped=args.show_dropped)

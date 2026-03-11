@@ -1,0 +1,14 @@
+# NOTE: torch is NOT listed here — it's already installed with CUDA in your torchgpu env.
+# Do NOT run `pip install torch` or it will overwrite your CUDA version with CPU.
+transformers>=4.25.0,<5.0.0
+pytorch-lightning>=1.9.0
+torchmetrics>=0.11.0
+sentencepiece>=0.1.96
+protobuf<=3.20.3
+numpy>=1.21.0
+pandas>=1.3.0
+scikit-learn>=1.0.0
+pubchempy>=1.0.4
+tensorboard>=2.11.0
+rich>=13.0.0
+tqdm>=4.64.0

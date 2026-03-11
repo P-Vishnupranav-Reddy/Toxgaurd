@@ -32,17 +32,6 @@ iupacGPT/iupac-gpt/iupacGPT2-gen50K.csv
 iupacGPT/iupac-gpt/data/iupacs_logp.csv
 iupacGPT/iupac-gpt/iupac_gpt/iupacs_logp.csv
 
-# Pretrained model weights (download from original iupacGPT repo)
-iupacGPT/iupac-gpt/checkpoints/iupac/pytorch_model.bin
-iupacGPT/iupac-gpt/checkpoints/iupac/model.safetensors
-iupacGPT/iupac-gpt/checkpoints/iupac/*.bin
-iupacGPT/iupac-gpt/checkpoints/iupac/*.safetensors
-iupacGPT/iupac-gpt/pretrained/
-
-# ══════════════════════════════════════════════════════════════
-# Training outputs — keep weights + reports, skip large files
-# ══════════════════════════════════════════════════════════════
-
 # ── API resolution cache (generated, can be re-created) ───────
 data/iupac_cs_failed_cache.csv
 data/iupac_failed_cache.csv

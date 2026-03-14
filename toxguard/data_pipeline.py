@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────
 # Score thresholds for severity display (inference only, not training)
 # ──────────────────────────────────────────────────────────────────────
-SEVERITY_THRESHOLDS = [0.20, 0.40, 0.60, 0.80]
+SEVERITY_THRESHOLDS = [0.20, 0.50, 0.65, 0.80]
 
 
 def _ld50_to_toxicity(ld50_mg_kg: float) -> Tuple[str, float]:
@@ -441,7 +441,7 @@ def prepare_combined_dataset(
     test_split: float = 0.1,
     batch_size: int = 32,
     num_workers: int = 0,
-) -> Tuple[DataLoader, DataLoader, DataLoader]:
+) -> Tuple[DataLoader, DataLoader, DataLoader, Dict[str, int]]:
     """Full pipeline: load all datasets -> create DataLoaders.
 
     Dataset sources (all with pre-computed binary labels from step 2):
@@ -557,4 +557,12 @@ def prepare_combined_dataset(
 
     logger.info(f"Combined: {total} compounds | "
                 f"Train: {len(train_ds)}, Val: {len(val_ds)}, Test: {len(test_ds)}")
-    return train_loader, val_loader, test_loader
+
+    # Compute class distribution for weighting
+    train_labels = [combined[i]["binary_labels"].item() for i in train_indices.tolist()]
+    n_pos = sum(1 for l in train_labels if l >= 0.5)
+    n_neg = len(train_labels) - n_pos
+    logger.info(f"Training class distribution: {n_pos} toxic, {n_neg} non-toxic "
+                f"(ratio {n_pos / max(n_neg, 1):.2f}:1)")
+
+    return train_loader, val_loader, test_loader, {"n_positive": n_pos, "n_negative": n_neg}

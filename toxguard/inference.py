@@ -161,37 +161,91 @@ class ToxGuardPredictor:
         )
 
     def predict_batch(
-        self, iupac_names: List[str], return_egnn_vector: bool = True
+        self, iupac_names: List[str], return_egnn_vector: bool = True,
+        batch_size: int = 32,
     ) -> List[ToxGuardPrediction]:
-        """Predict toxicity for multiple molecules.
+        """Predict toxicity for multiple molecules with GPU-batched inference.
+
+        Tokenizes all inputs, pads them into batches, and runs forward passes
+        on full batches for 10-100× speedup vs sequential prediction.
 
         Args:
             iupac_names: List of IUPAC names
             return_egnn_vector: Whether to include EGNN vectors
+            batch_size: Number of molecules per batch
 
         Returns:
             List of ToxGuardPrediction objects
         """
-        return [
-            self.predict(name, return_egnn_vector=return_egnn_vector)
-            for name in iupac_names
-        ]
+        from .model import score_to_severity_label
+        from torch.nn.utils.rnn import pad_sequence
 
-    def get_egnn_vectors(self, iupac_names: List[str]) -> torch.Tensor:
+        results = []
+
+        # Process in batches
+        for start in range(0, len(iupac_names), batch_size):
+            batch_names = iupac_names[start:start + batch_size]
+
+            # Tokenize all molecules in this batch
+            all_input_ids = []
+            for name in batch_names:
+                tokenized = self.tokenizer(name)
+                ids = torch.tensor(tokenized["input_ids"], dtype=torch.long)
+                bos = torch.tensor([self.tokenizer._convert_token_to_id(
+                    self.tokenizer.unk_token)])
+                ids = torch.cat([bos, ids])
+                all_input_ids.append(ids)
+
+            # Pad to same length
+            pad_id = getattr(self.tokenizer, 'pad_token_id', 0) or 0
+            padded_ids = pad_sequence(all_input_ids, batch_first=True,
+                                      padding_value=pad_id).to(self.device)
+            attention_mask = (padded_ids != pad_id).long().to(self.device)
+
+            # Single batched forward pass
+            with torch.no_grad():
+                output = self.model(
+                    input_ids=padded_ids,
+                    attention_mask=attention_mask,
+                    return_hidden=return_egnn_vector,
+                )
+
+            # Extract per-molecule results
+            binary_probs = torch.sigmoid(output.binary_logits).cpu()
+            for i, name in enumerate(batch_names):
+                prob = binary_probs[i].item()
+                is_toxic = prob >= self.threshold
+
+                egnn_vec = None
+                if return_egnn_vector and output.hidden_state is not None:
+                    egnn_vec = output.hidden_state[i].cpu().tolist()
+
+                results.append(ToxGuardPrediction(
+                    iupac_name=name,
+                    is_toxic=is_toxic,
+                    toxicity_score=prob,
+                    severity_label=score_to_severity_label(prob),
+                    confidence=prob,
+                    egnn_vector=egnn_vec,
+                ))
+
+        return results
+
+    def get_egnn_vectors(self, iupac_names: List[str],
+                         batch_size: int = 32) -> torch.Tensor:
         """Extract EGNN input vectors for a batch of molecules.
 
-        This is the primary interface for Phase 2 (EGNN integration).
+        Uses batched inference for efficient extraction.
 
         Args:
             iupac_names: List of IUPAC names
+            batch_size: Number of molecules per batch
 
         Returns:
             (N, 256) tensor of molecular representations for EGNN
         """
-        vectors = []
-        for name in iupac_names:
-            pred = self.predict(name, return_egnn_vector=True)
-            if pred.egnn_vector is not None:
-                vectors.append(torch.tensor(pred.egnn_vector))
-
+        preds = self.predict_batch(iupac_names, return_egnn_vector=True,
+                                   batch_size=batch_size)
+        vectors = [torch.tensor(p.egnn_vector) for p in preds
+                   if p.egnn_vector is not None]
         return torch.stack(vectors) if vectors else torch.empty(0, 256)

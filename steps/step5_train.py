@@ -101,7 +101,7 @@ def main(args: argparse.Namespace):
 
     # ── Data ──
     logger.info("Preparing datasets...")
-    train_loader, val_loader, test_loader = prepare_combined_dataset(
+    train_loader, val_loader, test_loader, class_info = prepare_combined_dataset(
         data_dir=args.data_dir,
         tokenizer=tokenizer,
         max_length=args.max_length,
@@ -122,6 +122,15 @@ def main(args: argparse.Namespace):
 
     # Set loss weight
     model.binary_loss_weight = args.binary_loss_weight
+
+    # Class imbalance compensation
+    if args.auto_class_weight:
+        model.set_class_weights(class_info["n_positive"], class_info["n_negative"])
+    if args.use_focal_loss:
+        model.use_focal_loss = True
+        model.focal_gamma = args.focal_gamma
+        model.focal_alpha = args.focal_alpha
+        logger.info(f"Using focal loss (gamma={args.focal_gamma}, alpha={args.focal_alpha})")
 
     # ── LoRA ──
     # Try to load LoRA config from step4's output
@@ -294,8 +303,8 @@ def parse_args() -> argparse.Namespace:
                         help="LoRA rank (r). Rank 16 balances capacity vs efficiency for this 7M-param model.")
     parser.add_argument("--lora_alpha", type=float, default=32.0,
                         help="LoRA scaling alpha (keep alpha = 2*rank for stable scaling)")
-    parser.add_argument("--lora_dropout", type=float, default=0.2,
-                        help="LoRA dropout (0.2 to reduce overfitting)")
+    parser.add_argument("--lora_dropout", type=float, default=0.15,
+                        help="LoRA dropout (0.15 balanced regularization)")
     parser.add_argument("--lora_targets", default="c_attn,c_proj,c_fc",
                         help="LoRA target modules: c_attn+c_proj (attention) + c_fc (MLP FFN)")
 
@@ -326,6 +335,16 @@ def parse_args() -> argparse.Namespace:
     # Loss weights
     parser.add_argument("--binary_loss_weight", type=float, default=1.0,
                         help="Weight for binary classification loss")
+
+    # Class imbalance
+    parser.add_argument("--auto_class_weight", action="store_true",
+                        help="Auto-compute pos_weight from training data to address class imbalance")
+    parser.add_argument("--use_focal_loss", action="store_true",
+                        help="Use focal loss instead of BCE (down-weights easy examples)")
+    parser.add_argument("--focal_gamma", type=float, default=2.0,
+                        help="Focal loss gamma (focusing parameter)")
+    parser.add_argument("--focal_alpha", type=float, default=0.25,
+                        help="Focal loss alpha (class balance weight)")
 
 
     # Early stopping

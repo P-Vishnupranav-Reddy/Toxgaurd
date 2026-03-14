@@ -210,6 +210,12 @@ class ToxGuardModel(nn.Module):
         # Label smoothing for BCE (Bug fix #4)
         self.label_smoothing = 0.1
 
+        # Class imbalance compensation
+        self.pos_weight: Optional[torch.Tensor] = None  # set via set_class_weights()
+        self.use_focal_loss = False
+        self.focal_gamma = 2.0
+        self.focal_alpha = 0.25
+
     @classmethod
     def from_pretrained_iupacgpt(
         cls, checkpoint_dir: str, **kwargs
@@ -299,22 +305,59 @@ class ToxGuardModel(nn.Module):
             target_binary=binary_labels,
         )
 
+    def set_class_weights(self, n_positive: int, n_negative: int):
+        """Set pos_weight for class-weighted BCE from dataset statistics.
+
+        pos_weight = n_negative / n_positive compensates for class imbalance
+        by penalizing false negatives (missing toxic compounds) more.
+        """
+        weight = n_negative / max(n_positive, 1)
+        self.pos_weight = torch.tensor([weight])
+        logger.info(f"Class weights set: pos_weight={weight:.4f} "
+                    f"(n_pos={n_positive}, n_neg={n_negative})")
+
     def _compute_loss(
         self,
         head_outputs: Dict[str, torch.Tensor],
         binary_labels: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute BCE loss with label smoothing.
+        """Compute loss with label smoothing + optional class weighting / focal loss.
 
-        L = BCE(binary_logits, smoothed_targets)
+        Supports three modes:
+          1. Standard BCE (default)
+          2. Class-weighted BCE (when pos_weight is set via set_class_weights)
+          3. Focal loss (when use_focal_loss=True) — down-weights easy examples
 
         Label smoothing: target 1 -> (1 - eps/2), target 0 -> eps/2
         """
         eps = self.label_smoothing
         smoothed_targets = binary_labels.float() * (1.0 - eps) + eps / 2.0
-        binary_loss = F.binary_cross_entropy_with_logits(
-            head_outputs["binary_logits"], smoothed_targets,
-        )
+        logits = head_outputs["binary_logits"]
+
+        if self.use_focal_loss:
+            # Focal loss: FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+            # Reduces contribution of easy-to-classify examples
+            bce = F.binary_cross_entropy_with_logits(
+                logits, smoothed_targets, reduction="none",
+            )
+            p = torch.sigmoid(logits)
+            p_t = p * smoothed_targets + (1 - p) * (1 - smoothed_targets)
+            focal_weight = (1 - p_t) ** self.focal_gamma
+
+            # Alpha balancing: alpha for positives, (1-alpha) for negatives
+            alpha_t = (self.focal_alpha * smoothed_targets
+                       + (1 - self.focal_alpha) * (1 - smoothed_targets))
+
+            binary_loss = (alpha_t * focal_weight * bce).mean()
+        else:
+            # Standard or class-weighted BCE
+            pw = None
+            if self.pos_weight is not None:
+                pw = self.pos_weight.to(logits.device)
+            binary_loss = F.binary_cross_entropy_with_logits(
+                logits, smoothed_targets, pos_weight=pw,
+            )
+
         return self.binary_loss_weight * binary_loss
 
     def get_egnn_input_vector(

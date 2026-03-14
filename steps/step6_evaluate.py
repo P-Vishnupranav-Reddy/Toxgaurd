@@ -225,9 +225,9 @@ def main():
     model = load_lora_weights(model, lora_path)
     logger.info(f"Loaded LoRA weights from {lora_path}")
 
-    # -- Build test DataLoader using the SAME stratified split as training (BUG #1 FIX)
+    # -- Build val + test DataLoaders using the SAME stratified split as training (BUG #1 FIX)
     # This calls prepare_combined_dataset which uses StratifiedShuffleSplit with seed=42
-    _, _, test_loader = prepare_combined_dataset(
+    _, val_loader, test_loader, _ = prepare_combined_dataset(
         data_dir=DATA_DIR,
         tokenizer=tokenizer,
         max_length=128,
@@ -237,6 +237,16 @@ def main():
         num_workers=0,  # 0 for evaluation stability
     )
     logger.info(f"Test set: {len(test_loader)} batches")
+
+    # -- Temperature scaling calibration on validation set --
+    from toxguard.calibration import TemperatureScaler
+    scaler = TemperatureScaler()
+    optimal_temp = scaler.calibrate(model, val_loader, device)
+    logger.info(f"Temperature scaling: T={optimal_temp:.4f}")
+
+    # Save calibration
+    calib_path = os.path.join(run_dir, "temperature.pt")
+    scaler.save(calib_path)
 
     # -- Evaluate
     binary_metrics = evaluate_on_test_set(model, test_loader, device)
@@ -266,6 +276,10 @@ def main():
     report_lines.append(f"    True Non-toxic  {cm[0][0]:>10}   {cm[0][1]:>10}")
     report_lines.append(f"    True Toxic      {cm[1][0]:>10}   {cm[1][1]:>10}")
 
+    report_lines.append(f"\n  Calibration:")
+    report_lines.append(f"    Temperature : {optimal_temp:.4f}")
+    report_lines.append(f"    (T > 1 = softened predictions, T < 1 = sharpened)")
+
     report_lines.append(f"\n  Severity labels (anchored to 0.5 binary decision boundary):")
     report_lines.append(f"    0.00-0.20 = Non-toxic       (very confident non-toxic)")
     report_lines.append(f"    0.20-0.50 = Unlikely toxic  (leans non-toxic)")
@@ -288,13 +302,17 @@ def main():
     # -- Save metrics as JSON
     metrics_path = os.path.join(run_dir, "eval_metrics.json")
     with open(metrics_path, "w", encoding="utf-8") as f:
-        json.dump({"binary": binary_metrics}, f, indent=2, default=str)
+        json.dump({
+            "binary": binary_metrics,
+            "calibration": {"temperature": optimal_temp},
+        }, f, indent=2, default=str)
     logger.info(f"Saved metrics to {metrics_path}")
 
     print("\n" + "-" * 60)
     print("  Step 6 complete.")
     print(f"    Evaluation report  : {report_path}")
     print(f"    Metrics JSON       : {metrics_path}")
+    print(f"    Calibration saved  : {calib_path}")
     print("  Next -> run:  python steps/step7_predict.py")
     print("-" * 60 + "\n")
 

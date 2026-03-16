@@ -1,0 +1,44 @@
+============================================================
+  TOXGUARD EVALUATION REPORT
+============================================================
+
+  Threshold Tuning (validation set sweep 0.10–0.90):
+    Best F1  threshold : 0.24  (val F1=0.8493)
+    Best MCC threshold : 0.55  (val MCC=0.3598)
+    Best Acc threshold : 0.31  (val Acc=0.7612)
+    Operative threshold: 0.24  (best F1)
+
+  Binary Classification Metrics @ threshold=0.50 (default):
+    AUC-ROC   : 0.7860
+    AUC-PRC   : 0.8270
+    Accuracy  : 0.7089
+    Precision : 0.7486
+    Recall    : 0.7177
+    F1 Score  : 0.7328
+    MCC       : 0.4139
+
+  Binary Classification Metrics @ threshold=0.24 (tuned):
+    AUC-ROC   : 0.7860
+    AUC-PRC   : 0.8270
+    Accuracy  : 0.6851
+    Precision : 0.6572
+    Recall    : 0.9067
+    F1 Score  : 0.7621
+    MCC       : 0.3693
+    Samples   : 2350 (1307 toxic, 1043 non-toxic)
+
+  Binary Confusion Matrix (tuned threshold=0.24):
+                  Pred Non-toxic   Pred Toxic
+    True Non-toxic         425          618
+    True Toxic             122         1185
+
+  Calibration:
+    Temperature : 1.2371
+    (T > 1 = softened predictions, T < 1 = sharpened)
+
+  Severity labels (anchored to 0.5 binary decision boundary):
+    0.00-0.20 = Non-toxic       (very confident non-toxic)
+    0.20-0.50 = Unlikely toxic  (leans non-toxic)
+    0.50-0.65 = Likely toxic    (leans toxic, lower confidence)
+    0.65-0.80 = Moderately toxic (moderately confident toxic)
+    0.80-1.00 = Highly toxic    (very confident toxic)

@@ -84,8 +84,15 @@ import requests
 # ── RDKit (SMILES canonicalisation + stereo detection) ────────────────
 from rdkit import Chem
 from rdkit import RDLogger
+from rdkit.Chem.MolStandardize import rdMolStandardize
 
 RDLogger.logger().setLevel(RDLogger.ERROR)   # suppress warnings
+
+# Tautomer canonicaliser — converts keto↔enol, amide↔imidol, etc. to a
+# single canonical tautomer form before IUPAC resolution.  This prevents
+# multiple SMILES for the same compound from resolving to the same IUPAC
+# name and being incorrectly flagged as "collision_unresolvable".
+_TAUTOMER_ENUMERATOR = rdMolStandardize.TautomerEnumerator()
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -121,7 +128,7 @@ NCI_CIR_URL           = "https://cactus.nci.nih.gov/chemical/structure/{}/iupac_
 
 CHEMSPIDER_API_KEY = os.environ.get(
     "CHEMSPIDER_API_KEY",
-    "$$",
+    "Vnn4UotnaAadd7vc78PCS12OkEKDJw4FFiCiacMg",
 )
 
 # Rate limiting (PubChem: ≤5 req/s, ≤400 req/min)
@@ -161,6 +168,16 @@ def preprocess_smiles(raw_smiles: str):
     frags = Chem.GetMolFrags(mol, asMols=True, sanitizeFrags=True)
     if frags and len(frags) > 1:
         mol = max(frags, key=lambda m: m.GetNumHeavyAtoms())
+
+    # ── Tautomer canonicalisation ──────────────────────────────────
+    # Converts keto↔enol, amide↔imidol, and other tautomeric pairs to
+    # a single canonical tautomer so that multiple input SMILES that
+    # represent the same compound are collapsed to one lookup key.
+    # This is the primary fix for "collision_unresolvable" failures.
+    try:
+        mol = _TAUTOMER_ENUMERATOR.Canonicalize(mol)
+    except Exception:
+        pass   # If canonicalisation fails, proceed with the original mol
 
     # ── Assign stereochemistry so stereo queries work ─────────────
     Chem.AssignStereochemistry(mol, cleanIt=True, force=True)

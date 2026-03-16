@@ -11,17 +11,19 @@ All entries use PROPER IUPAC names:
 NO trade/common names: aspirin, ibuprofen, caffeine, beeswax, PEG etc.
 
 Usage:
-  python steps/build_common_molecules.py              # default max 15 tokens
+  python steps/build_common_molecules.py              # default max 300 tokens, no SMILES
+  python steps/build_common_molecules.py --add_smiles # add SMILES column via PubChem
   python steps/build_common_molecules.py --max_tokens 9
   python steps/build_common_molecules.py --max_tokens 12 --show_dropped
 
 Output:  data/common_molecules_raw.csv
-Columns: iupac_name, is_toxic, token_count
+Columns: smiles (if --add_smiles), iupac_name, is_toxic, token_count
 """
 
 import os
 import sys
 import csv
+import time
 import argparse
 import logging
 
@@ -1268,7 +1270,64 @@ CANDIDATES = [
 ]
 
 
-def build_dataset(max_tokens: int = 300, show_dropped: bool = False):
+def lookup_smiles_pubchem(iupac_name: str, delay: float = 0.22) -> str:
+    """Look up the canonical SMILES for an IUPAC name via PubChem PUG REST.
+
+    Returns the canonical SMILES string, or "" if not found / error.
+    Rate-limits to ~5 req/s (0.22 s delay between calls).
+    """
+    import requests
+    from urllib.parse import quote
+
+    url = (
+        "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"
+        + quote(iupac_name, safe="")
+        + "/property/IsomericSMILES/JSON"
+    )
+    try:
+        resp = requests.get(url, timeout=15)
+        time.sleep(delay)
+        if resp.status_code == 200:
+            data = resp.json()
+            props = data.get("PropertyTable", {}).get("Properties", [])
+            if props:
+                prop = props[0]
+                # PubChem may return the key as IsomericSMILES, CanonicalSMILES,
+                # ConnectivitySMILES, or plain SMILES depending on API version.
+                for key in ("IsomericSMILES", "CanonicalSMILES", "SMILES",
+                            "ConnectivitySMILES"):
+                    if prop.get(key):
+                        return prop[key]
+    except Exception as e:
+        if not getattr(lookup_smiles_pubchem, "_error_shown", False):
+            print(f"\n  [PubChem WARNING] First API call failed: {type(e).__name__}: {e}")
+            print("  Subsequent failures will be silent. "
+                  "Check network connectivity or install 'requests'.")
+            lookup_smiles_pubchem._error_shown = True
+    return ""
+
+
+def load_smiles_cache(cache_path: str) -> dict:
+    """Load iupac_name → canonical_smiles mapping from step3_cache.csv.
+
+    step3_cache.csv maps canonical_smiles → iupac_name, so we build the
+    reverse mapping here: iupac_name.lower() → canonical_smiles.
+    """
+    smiles_map: dict = {}
+    if not os.path.exists(cache_path):
+        return smiles_map
+    with open(cache_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            smi  = row.get("canonical_smiles", "").strip()
+            name = row.get("iupac_name", "").strip().lower()
+            if smi and name and name != "nan":
+                smiles_map[name] = smi
+    return smiles_map
+
+
+def build_dataset(max_tokens: int = 300, show_dropped: bool = False,
+                  add_smiles: bool = False):
     """Load tokenizer, count tokens, filter, write CSV."""
     from toxguard.tokenizer import get_tokenizer
 
@@ -1319,13 +1378,84 @@ def build_dataset(max_tokens: int = 300, show_dropped: bool = False):
         bar = "█" * (dist[tok] // 3)
         print(f"  {tok:>2} tokens : {dist[tok]:>4}  {bar}")
 
+    # ── SMILES lookup (optional) ──────────────────────────────────────
+    # common_molecules IUPAC names are independent of all other datasets —
+    # they were never derived from SMILES.  We must NOT look them up in
+    # step3_cache because that cache contains SMILES already assigned to
+    # other training datasets, which would reintroduce cross-dataset
+    # duplicates that step2 carefully removed.
+    #
+    # Source: PubChem REST API only.
+    # Rerun cache: data/common_smiles_cache.csv stores results from previous
+    # runs of THIS script only, keyed by exact iupac_name, so reruns are fast.
+    smiles_col: list = []
+    if add_smiles:
+        own_cache_path = os.path.join(DATA_DIR, "common_smiles_cache.csv")
+
+        # Load own rerun-cache (exact iupac_name → smiles)
+        own_cache: dict = {}
+        if os.path.exists(own_cache_path):
+            with open(own_cache_path, newline="", encoding="utf-8") as _f:
+                for row in csv.DictReader(_f):
+                    n = row.get("iupac_name", "").strip()
+                    s = row.get("smiles", "").strip()
+                    if n:
+                        own_cache[n] = s   # "" means previously tried and failed
+
+        print(f"\nLooking up SMILES via PubChem ...")
+        print(f"  Rerun cache: {len(own_cache)} entries from previous runs")
+
+        n_from_cache   = 0
+        n_from_pubchem = 0
+        n_failed       = 0
+        newly_fetched: list = []
+
+        for idx, (name, label, n_tok) in enumerate(kept):
+            if name in own_cache:
+                # Already fetched in a previous run of this script
+                smiles_col.append(own_cache[name])
+                n_from_cache += 1
+            else:
+                smi = lookup_smiles_pubchem(name)
+                smiles_col.append(smi)
+                own_cache[name] = smi
+                newly_fetched.append((name, smi))
+                if smi:
+                    n_from_pubchem += 1
+                else:
+                    n_failed += 1
+
+            if (idx + 1) % 50 == 0:
+                print(f"  ... {idx+1}/{len(kept)} done "
+                      f"(rerun_cache={n_from_cache}, api={n_from_pubchem}, fail={n_failed})")
+
+        # Append newly fetched entries to own rerun-cache
+        if newly_fetched:
+            write_header = not os.path.exists(own_cache_path)
+            with open(own_cache_path, "a", newline="", encoding="utf-8") as _f:
+                writer_c = csv.writer(_f)
+                if write_header:
+                    writer_c.writerow(["iupac_name", "smiles"])
+                for n, s in newly_fetched:
+                    writer_c.writerow([n, s])
+
+        print(f"  SMILES lookup complete: "
+              f"rerun_cache={n_from_cache}, api={n_from_pubchem}, failed={n_failed}")
+    else:
+        smiles_col = [""] * len(kept)
+
     out_path = os.path.join(DATA_DIR, "common_molecules_raw.csv")
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["iupac_name", "is_toxic", "token_count"])
-        for name, label, n_tok in kept:
-            writer.writerow([name, label, n_tok])
+        if add_smiles:
+            writer.writerow(["smiles", "iupac_name", "is_toxic", "token_count"])
+            for (name, label, n_tok), smi in zip(kept, smiles_col):
+                writer.writerow([smi, name, label, n_tok])
+        else:
+            writer.writerow(["iupac_name", "is_toxic", "token_count"])
+            for name, label, n_tok in kept:
+                writer.writerow([name, label, n_tok])
 
     print(f"\nSaved → {out_path}")
     return out_path
@@ -1341,5 +1471,11 @@ if __name__ == "__main__":
         "--show_dropped", action="store_true",
         help="Print all dropped molecules and their token counts"
     )
+    parser.add_argument(
+        "--add_smiles", action="store_true",
+        help="Attempt to populate a 'smiles' column for each molecule by checking "
+             "data/step3_cache.csv first, then falling back to the PubChem REST API"
+    )
     args = parser.parse_args()
-    build_dataset(max_tokens=args.max_tokens, show_dropped=args.show_dropped)
+    build_dataset(max_tokens=args.max_tokens, show_dropped=args.show_dropped,
+                  add_smiles=args.add_smiles)

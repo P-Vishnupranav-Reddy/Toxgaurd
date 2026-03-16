@@ -16,7 +16,7 @@ What it does:
 Run from project root:
   python steps/step4_verify_lora.py
   python steps/step4_verify_lora.py --rank 4    # try a smaller rank
-  python steps/step4_verify_lora.py --rank 32   # default rank
+  python steps/step4_verify_lora.py --rank 32   # rank 32 (default)
 """
 
 import os
@@ -86,9 +86,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="STEP 4: Apply and verify LoRA adapters on IUPACGPT"
     )
-    parser.add_argument("--rank",    type=int,   default=16,    help="LoRA rank (default: 16)")
-    parser.add_argument("--alpha",   type=float, default=32.0,  help="LoRA alpha (default: 32.0 = 2×rank)")
-    parser.add_argument("--dropout", type=float, default=0.1,   help="LoRA dropout (default: 0.1)")
+    parser.add_argument("--rank",    type=int,   default=32,    help="LoRA rank (default: 32)")
+    parser.add_argument("--alpha",   type=float, default=64.0,  help="LoRA alpha (default: 64.0 = 2×rank)")
+    parser.add_argument("--dropout", type=float, default=0.2,   help="LoRA dropout (default: 0.2)")
     parser.add_argument("--targets", type=str,   default="c_attn,c_proj,c_fc",
                         help="Target modules (default: c_attn,c_proj,c_fc — attention + MLP FFN)")
     args = parser.parse_args()

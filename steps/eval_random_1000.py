@@ -134,8 +134,8 @@ def load_model(run_dir: str, device: str):
         with open(run_cfg_path) as f:
             cfg = json.load(f)
         lora_config = LoRAConfig(
-            r=cfg.get("lora_rank", 16),
-            alpha=cfg.get("lora_alpha", 32.0),
+            r=cfg.get("lora_rank", 32),
+            alpha=cfg.get("lora_alpha", 64.0),
             dropout=cfg.get("lora_dropout", 0.2),
             target_modules=cfg.get("lora_targets", "c_attn,c_proj,c_fc").split(","),
             fan_in_fan_out=True,

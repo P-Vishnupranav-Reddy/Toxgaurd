@@ -1,0 +1,5 @@
+learning_rate: 0.0001
+max_steps: 47640
+scheduler_type: cosine
+warmup_steps: 600
+weight_decay: 0.01

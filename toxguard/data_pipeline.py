@@ -1,4 +1,4 @@
-"""Data pipeline for ToxCast, Tox21, and T3DB toxicity datasets.
+"""Data pipeline for ToxCast, Tox21, hERG, DILI, and Common Molecules datasets.
 
 Provides PyTorch Dataset classes and a unified data-loading pipeline
 for training ToxGuard (IUPACGPT + LoRA) on binary toxicity prediction.
@@ -11,17 +11,23 @@ Architecture insight:
 Binary classification:
   ToxCast: toxic if ANY assay is positive (pos_count >= 1)
   Tox21  : toxic if ANY assay is positive (pos_count >= 1)
-  T3DB   : all entries are known toxins (is_toxic = 1)
+  T3DB   : all entries are known toxins (is_toxic = 1) [EXTERNAL VALIDATION ONLY]
 
 Toxicity score (regression target):
   ToxCast: fraction of positive assays = pos_count / tested_count
   Tox21  : fraction of positive assays = pos_count / tested_count
   T3DB   : derived from LD50 using WHO/GHS classification scale
 
-Datasets (all use *_final.csv format with pre-computed labels):
-  - ToxCast : data/toxcast_final.csv   (binary + score from ALL 617 assays)
-  - Tox21   : data/tox21_final.csv     (binary + score from 12 assays)
-  - T3DB    : data/t3db_processed.csv  (binary + score from LD50)
+Training datasets (all use *_final.csv format with pre-computed labels):
+  - ToxCast        : data/toxcast_final.csv         (binary + score from ALL 617 assays)
+  - Tox21          : data/tox21_final.csv           (binary + score from 12 assays)
+  - hERG           : data/herg_final.csv            (cardiotoxicity)
+  - DILI           : data/dili_final.csv            (drug-induced liver injury)
+  - CommonMolecules: data/common_molecules_final.csv (curated short IUPAC names)
+
+External validation only (NOT in training split):
+  - T3DB   : data/t3db_processed.csv  — nearly all-toxic (99.2%), used for recall audits
+  - ClinTox: data/clintox_final.csv   — severely imbalanced (3.4% toxic), clinical-trial labels
 """
 
 import os
@@ -323,6 +329,11 @@ class MoleculeDataset(Dataset):
             )
         df = df.dropna(subset=[iupac_col])
         self.iupac_names = df[iupac_col].values
+        
+        if "smiles" in df.columns:
+            self.smiles = df["smiles"].values
+        else:
+            self.smiles = np.array([""] * len(df))
 
         if all_toxic:
             self.binary_labels = np.ones(len(df), dtype=np.int64)
@@ -399,6 +410,16 @@ class ToxicityDataset(Dataset):
                     return self.datasets[i][idx - self.cumulative_sizes[i - 1]]
         raise IndexError(f"Index {idx} out of range for dataset of size {len(self)}")
 
+    @property
+    def smiles(self):
+        """Get concatenated SMILES strings for all datasets (used for scaffold splitting)."""
+        return np.concatenate([ds.smiles for ds in self.datasets])
+
+    @property
+    def binary_labels(self):
+        """Get concatenated binary labels for all datasets."""
+        return np.concatenate([ds.binary_labels for ds in self.datasets])
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Collator
@@ -433,6 +454,73 @@ class ToxicityCollator:
 # Data Preparation Pipeline
 # ──────────────────────────────────────────────────────────────────────
 
+def load_external_validation_datasets(
+    data_dir: str = "./data",
+    tokenizer=None,
+    max_length: int = 1024,
+    batch_size: int = 32,
+    num_workers: int = 0,
+) -> Dict[str, DataLoader]:
+    """Load external validation datasets (T3DB and ClinTox) as separate DataLoaders.
+
+    These datasets are intentionally excluded from training to serve as
+    held-out external validation sets that test generalisation:
+
+      - T3DB   : nearly all-toxic (99.2%) — tests recall / sensitivity on known toxins
+      - ClinTox: severely imbalanced (3.4% toxic) — tests specificity / precision
+                 on FDA-approved drugs + clinical-trial failures
+
+    Both loaders are returned as DataLoaders with shuffle=False.
+
+    Args:
+        data_dir:    Directory containing processed data CSVs.
+        tokenizer:   ToxGuardTokenizer instance.
+        max_length:  Maximum token sequence length.
+        batch_size:  Evaluation batch size.
+        num_workers: DataLoader worker count.
+
+    Returns:
+        Dict with keys "t3db" and/or "clintox" mapping to DataLoader objects.
+        Keys are omitted if the CSV is not found.
+    """
+    t3db_path    = os.path.join(data_dir, "t3db_processed.csv")
+    clintox_path = os.path.join(data_dir, "clintox_final.csv")
+
+    _persistent = num_workers > 0
+    _pin_memory  = num_workers > 0
+
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = getattr(tokenizer, "eos_token_id", 0) or 0
+    collator = ToxicityCollator(pad_id)
+
+    loaders: Dict[str, DataLoader] = {}
+
+    for name, path, cls in [
+        ("t3db",    t3db_path,    T3DBDataset),
+        ("clintox", clintox_path, ClinToxDataset),
+    ]:
+        if os.path.exists(path):
+            try:
+                ds = cls(path, tokenizer, max_length, dataset_name=name.upper())
+                loader = DataLoader(
+                    ds, batch_size=batch_size, shuffle=False,
+                    collate_fn=collator, num_workers=num_workers,
+                    persistent_workers=_persistent, pin_memory=_pin_memory,
+                )
+                loaders[name] = loader
+                logger.info(f"External validation | {name.upper()}: {len(ds)} compounds")
+            except Exception as e:
+                logger.warning(f"Could not load external validation dataset {name}: {e}")
+        else:
+            logger.warning(
+                f"External validation dataset '{name}' not found at {path}. "
+                f"Skipping."
+            )
+
+    return loaders
+
+
 def prepare_combined_dataset(
     data_dir: str = "./data",
     tokenizer=None,
@@ -441,26 +529,28 @@ def prepare_combined_dataset(
     test_split: float = 0.1,
     batch_size: int = 32,
     num_workers: int = 0,
+    split_method: str = "random",
 ) -> Tuple[DataLoader, DataLoader, DataLoader, Dict[str, int]]:
-    """Full pipeline: load all datasets -> create DataLoaders.
+    """Full pipeline: load training datasets -> create DataLoaders.
 
-    Dataset sources (all with pre-computed binary labels from step 2):
+    Training dataset sources (all with pre-computed binary labels from step 2):
       - ToxCast          : data/toxcast_final.csv       (binary from 617 assays)
       - Tox21            : data/tox21_final.csv         (binary from 12 assays)
-      - T3DB             : data/t3db_processed.csv      (all toxic)
-      - ClinTox          : data/clintox_final.csv       (clinical-trial toxicity)
       - hERG             : data/herg_final.csv          (cardiotoxicity — hERG blocker)
       - DILI             : data/dili_final.csv          (drug-induced liver injury)
       - Common Molecules : data/common_molecules_final.csv (curated short IUPAC)
 
+    NOTE: T3DB and ClinTox are intentionally excluded from training.
+    Use load_external_validation_datasets() to evaluate on them separately.
+    T3DB is 99.2% toxic (would bias the model) and ClinTox is 3.4% toxic
+    (would severely harm recall). Both serve as cleaner external benchmarks.
+
     Returns:
-        (train_loader, val_loader, test_loader)
+        (train_loader, val_loader, test_loader, {"n_positive": ..., "n_negative": ...})
     """
-    # Dataset file paths
+    # Dataset file paths — training only
     toxcast_path   = os.path.join(data_dir, "toxcast_final.csv")
     tox21_path     = os.path.join(data_dir, "tox21_final.csv")
-    t3db_path      = os.path.join(data_dir, "t3db_processed.csv")
-    clintox_path   = os.path.join(data_dir, "clintox_final.csv")
     herg_path      = os.path.join(data_dir, "herg_final.csv")
     dili_path      = os.path.join(data_dir, "dili_final.csv")
     common_path    = os.path.join(data_dir, "common_molecules_final.csv")
@@ -471,8 +561,6 @@ def prepare_combined_dataset(
     for name, path, cls in [
         ("ToxCast",          toxcast_path, ToxCastDataset),
         ("Tox21",            tox21_path,   Tox21Dataset),
-        ("T3DB",             t3db_path,    T3DBDataset),
-        ("ClinTox",          clintox_path, ClinToxDataset),
         ("hERG",             herg_path,    HErgDataset),
         ("DILI",             dili_path,    DILIDataset),
         ("CommonMolecules",  common_path,  CommonMoleculesDataset),
@@ -495,33 +583,162 @@ def prepare_combined_dataset(
 
     combined = ToxicityDataset(datasets_list)
 
-    # -- Stratified split by binary label + source dataset ---
+    # -- Splitting ---
     total = len(combined)
-    strat_labels = []
-    for idx in range(total):
-        sample = combined[idx]
-        binary = int(sample["binary_labels"].item())
-        for di, size in enumerate(combined.cumulative_sizes):
-            if idx < size:
-                ds_idx = di
-                break
-        strat_labels.append(f"{ds_idx}:{binary}")
-    strat_labels = np.array(strat_labels)
+    n_test = int(total * test_split)
+    n_val = int(total * val_split)
+    n_train = total - n_val - n_test
 
-    # First split: train+val vs test
-    test_frac = test_split
-    sss1 = StratifiedShuffleSplit(n_splits=1, test_size=test_frac, random_state=42)
-    trainval_idx, test_idx = next(sss1.split(np.zeros(total), strat_labels))
+    if split_method == "scaffold":
+        logger.info("Performing Bemis-Murcko scaffold split... (prevents structural data leakage)")
+        try:
+            from rdkit import Chem
+            from rdkit.Chem.Scaffolds import MurckoScaffold
+            from collections import defaultdict
+            
+            smiles_list = combined.smiles
+            scaffold_groups = defaultdict(list)
+            
+            for i, sm in enumerate(smiles_list):
+                if not sm:
+                    scaffold_groups["_NO_SMILES_"].append(i)
+                    continue
+                try:
+                    mol = Chem.MolFromSmiles(sm)
+                    if mol:
+                        scaffold = MurckoScaffold.MurckoScaffoldSmiles(mol=mol)
+                        scaffold_groups[scaffold].append(i)
+                    else:
+                        scaffold_groups["_INVALID_"].append(i)
+                except:
+                    scaffold_groups["_ERROR_"].append(i)
+            
+            # Stratified scaffold split:
+            # Sort groups deterministically (by scaffold string for reproducibility),
+            # then assign each scaffold group to the split whose current toxic ratio
+            # is furthest from the global target ratio — while still respecting size
+            # budgets.  This keeps train/val/test class distributions balanced.
+            all_labels = combined.binary_labels   # shape (N,)
+            global_toxic_ratio = float(all_labels.sum()) / max(len(all_labels), 1)
+            logger.info(
+                f"Global toxic ratio: {global_toxic_ratio:.3f} "
+                f"({int(all_labels.sum())} toxic / {len(all_labels)} total)"
+            )
 
-    # Second split: train vs val (from train+val portion)
-    val_frac_of_trainval = val_split / (1.0 - test_split)
-    sss2 = StratifiedShuffleSplit(n_splits=1, test_size=val_frac_of_trainval, random_state=42)
-    trainval_strat = strat_labels[trainval_idx]
-    train_sub_idx, val_sub_idx = next(sss2.split(np.zeros(len(trainval_idx)), trainval_strat))
+            # Sort by scaffold key for deterministic ordering; within same key sort
+            # largest group first so large scaffolds get placed early.
+            sorted_groups = sorted(
+                scaffold_groups.items(),
+                key=lambda kv: (-len(kv[1]), kv[0])
+            )
 
-    train_indices = trainval_idx[train_sub_idx]
-    val_indices = trainval_idx[val_sub_idx]
-    test_indices = test_idx
+            train_indices, val_indices, test_indices = [], [], []
+            # Track toxic counts per split to maintain balance
+            split_toxic  = [0, 0, 0]   # [train, val, test]
+            split_total  = [0, 0, 0]
+
+            for _scaffold_key, group in sorted_groups:
+                group_toxic = int(sum(1 for i in group if all_labels[i] >= 0.5))
+                g = len(group)
+
+                # Determine which split(s) still have room
+                can_train = (split_total[0] + g) <= int(n_train * 1.05)  # 5% slack
+                can_val   = (split_total[1] + g) <= int(n_val   * 1.10)
+                can_test  = True   # test absorbs the remainder
+
+                # Current toxic ratios (avoid div/0)
+                def _ratio(idx):
+                    return split_toxic[idx] / max(split_total[idx], 1)
+
+                # Score: how much does adding this group *improve* balance?
+                # Lower = better (closer to global ratio after adding group)
+                def _balance_score(idx):
+                    new_ratio = (split_toxic[idx] + group_toxic) / max(split_total[idx] + g, 1)
+                    return abs(new_ratio - global_toxic_ratio)
+
+                # Priority: fill train first, then val, then test
+                if can_train and split_total[0] < n_train:
+                    chosen = 0
+                elif can_val and split_total[1] < n_val:
+                    chosen = 1
+                else:
+                    chosen = 2
+
+                # Among eligible splits that still need molecules, prefer the one
+                # whose ratio would move closest to global target
+                eligible = []
+                if can_train and split_total[0] < n_train:
+                    eligible.append(0)
+                if can_val and split_total[1] < n_val:
+                    eligible.append(1)
+                if len(eligible) > 0:
+                    chosen = min(eligible, key=_balance_score)
+                else:
+                    chosen = 2
+
+                if chosen == 0:
+                    train_indices.extend(group)
+                elif chosen == 1:
+                    val_indices.extend(group)
+                else:
+                    test_indices.extend(group)
+
+                split_toxic[chosen] += group_toxic
+                split_total[chosen] += g
+
+            train_indices = np.array(train_indices)
+            val_indices   = np.array(val_indices)
+            test_indices  = np.array(test_indices)
+
+            # Log class ratios for each split
+            def _log_ratio(name, indices):
+                if len(indices) == 0:
+                    return
+                n_tox = int(all_labels[indices].sum())
+                ratio = n_tox / max(len(indices), 1)
+                logger.info(
+                    f"  {name:5s}: {len(indices):5d} samples | "
+                    f"{n_tox} toxic ({ratio:.3f}) | "
+                    f"{len(indices)-n_tox} non-toxic"
+                )
+            _log_ratio("Train", train_indices)
+            _log_ratio("Val",   val_indices)
+            _log_ratio("Test",  test_indices)
+            
+        except ImportError:
+            logger.error("RDKit is required for scaffold splitting. Falling back to random split.")
+            split_method = "random"
+
+    if split_method == "random":
+        logger.info("Performing stratified random split...")
+        from sklearn.model_selection import StratifiedShuffleSplit
+        
+        # Extract labels to stratify the split
+        strat_labels = []
+        for idx in range(total):
+            sample = combined[idx]
+            binary = int(sample["binary_labels"].item())
+            for di, size in enumerate(combined.cumulative_sizes):
+                if idx < size:
+                    ds_idx = di
+                    break
+            strat_labels.append(f"{ds_idx}:{binary}")
+        strat_labels = np.array(strat_labels)
+        
+        # First split: train+val vs test
+        test_frac = test_split
+        sss1 = StratifiedShuffleSplit(n_splits=1, test_size=test_frac, random_state=42)
+        trainval_idx, test_idx = next(sss1.split(np.zeros(total), strat_labels))
+
+        # Second split: train vs val (from train+val portion)
+        val_frac_of_trainval = val_split / (1.0 - test_split)
+        sss2 = StratifiedShuffleSplit(n_splits=1, test_size=val_frac_of_trainval, random_state=42)
+        trainval_strat = strat_labels[trainval_idx]
+        train_sub_idx, val_sub_idx = next(sss2.split(np.zeros(len(trainval_idx)), trainval_strat))
+
+        train_indices = trainval_idx[train_sub_idx]
+        val_indices = trainval_idx[val_sub_idx]
+        test_indices = test_idx
 
     train_ds = Subset(combined, train_indices.tolist())
     val_ds   = Subset(combined, val_indices.tolist())

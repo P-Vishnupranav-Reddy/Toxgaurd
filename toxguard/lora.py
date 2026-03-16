@@ -25,22 +25,22 @@ class LoRAConfig:
     """Configuration for LoRA adaptation.
     
     Attributes:
-        r: Rank of the low-rank decomposition (default: 16)
-        alpha: Scaling factor (default: 32.0). Effective scale = alpha / r.
+        r: Rank of the low-rank decomposition (default: 32)
+        alpha: Scaling factor (default: 64.0). Effective scale = alpha / r.
                Best practice: keep alpha = 2 × r for stable scaling.
-        dropout: Dropout probability on LoRA path (default: 0.1)
+        dropout: Dropout probability on LoRA path (default: 0.2)
         target_modules: Which linear layers to apply LoRA to.
             For IUPACGPT (GPT-2 style, 8 layers, 256 dim):
               c_attn  — combined Q/K/V projection  (8 modules)
               c_proj  — attention output + MLP out  (16 modules)
               c_fc    — MLP first linear (FFN up)   (8 modules)
-            All three targets give ~524k LoRA params (~7.4% of 7.1M base)
+            All three targets give ~1.05M LoRA params (~14.0% of 7.1M base)
         merge_weights: Whether to merge LoRA weights into base at inference
         fan_in_fan_out: Set True for Conv1D layers (GPT-2 uses Conv1D, not Linear)
     """
-    r: int = 16
-    alpha: float = 32.0
-    dropout: float = 0.1
+    r: int = 32
+    alpha: float = 64.0
+    dropout: float = 0.2
     target_modules: List[str] = field(
         default_factory=lambda: ["c_attn", "c_proj", "c_fc"]
     )

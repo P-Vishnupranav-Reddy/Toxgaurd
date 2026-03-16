@@ -83,17 +83,27 @@ def load_predictor(run_dir: str, device: str):
     model = ToxGuardModel.from_pretrained_iupacgpt(CHECKPOINT_DIR)
     model.config.pad_token_id = tokenizer.pad_token_id
 
-    lora_cfg_path = os.path.join(OUTPUT_DIR, "lora_config.json")
-    if os.path.exists(lora_cfg_path):
-        with open(lora_cfg_path) as f:
-            cfg = json.load(f)
-        lora_config = LoRAConfig(
-            r=cfg["r"], alpha=cfg["alpha"], dropout=cfg["dropout"],
-            target_modules=cfg.get("target_modules", ["c_attn", "c_proj", "c_fc"]),
-            fan_in_fan_out=True,
-        )
-    else:
-        lora_config = LoRAConfig()
+    # Read LoRA config from the run's own config.json — this is the authoritative
+    # source of what rank/alpha were used during training for this specific run.
+    run_cfg_path = os.path.join(run_dir, "config.json")
+    lora_rank    = 32
+    lora_alpha   = 64.0
+    lora_dropout = 0.2
+    lora_targets = ["c_attn", "c_proj", "c_fc"]
+    if os.path.exists(run_cfg_path):
+        with open(run_cfg_path) as f:
+            run_cfg = json.load(f)
+        lora_rank    = run_cfg.get("lora_rank",    lora_rank)
+        lora_alpha   = run_cfg.get("lora_alpha",   lora_alpha)
+        lora_dropout = run_cfg.get("lora_dropout", lora_dropout)
+        raw_targets  = run_cfg.get("lora_targets", ",".join(lora_targets))
+        lora_targets = raw_targets.split(",") if isinstance(raw_targets, str) else raw_targets
+
+    lora_config = LoRAConfig(
+        r=lora_rank, alpha=lora_alpha, dropout=lora_dropout,
+        target_modules=lora_targets,
+        fan_in_fan_out=True,
+    )
 
     model, _ = apply_lora_to_model(model, lora_config)
     model = load_lora_weights(model, lora_path)

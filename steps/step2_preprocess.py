@@ -526,8 +526,11 @@ def main():
         # Dedup against all SMILES-based datasets (common molecules use IUPAC names)
         n_before = len(cm_df)
         logger.info(f"  Common molecules raw: {n_before} compounds")
-        # Keep only iupac_name + is_toxic (drop token_count and any extra columns)
-        common_final = cm_df[["iupac_name", "is_toxic"]].copy()
+        # Keep iupac_name + is_toxic, and smiles if present (drop token_count etc.)
+        keep_cols = ["iupac_name", "is_toxic"]
+        if "smiles" in cm_df.columns:
+            keep_cols = ["smiles"] + keep_cols
+        common_final = cm_df[keep_cols].copy()
         n_toxic = int(common_final["is_toxic"].sum())
         n_nontoxic = len(common_final) - n_toxic
         logger.info(f"  Toxic: {n_toxic} ({100*n_toxic/len(common_final):.1f}%) | "

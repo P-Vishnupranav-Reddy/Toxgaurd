@@ -25,7 +25,7 @@ Architecture:
                 v
   +-----------------------------+
   |  GPT-2 Transformer (frozen) |  8 layers, 8 heads, 256 dim
-  |  + LoRA adapters (trainable)|  rank-16 on c_attn, c_proj, c_fc
+   |  + LoRA adapters (trainable)|  rank-32 on c_attn, c_proj, c_fc
   +-------------+---------------+
                 v
   +-----------------------------+
@@ -214,7 +214,7 @@ class ToxGuardModel(nn.Module):
         self.pos_weight: Optional[torch.Tensor] = None  # set via set_class_weights()
         self.use_focal_loss = False
         self.focal_gamma = 2.0
-        self.focal_alpha = 0.25
+        self.focal_alpha = 0.45  # calibrated for ~54% toxic training balance
 
     @classmethod
     def from_pretrained_iupacgpt(

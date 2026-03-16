@@ -1,0 +1,29 @@
+============================================================
+  TOXGUARD EVALUATION REPORT
+============================================================
+
+  Binary Classification Metrics (toxic vs non-toxic):
+    AUC-ROC   : 0.7715
+    AUC-PRC   : 0.7076
+    Accuracy  : 0.7043
+    Precision : 0.6227
+    Recall    : 0.6451
+    F1 Score  : 0.6337
+    MCC       : 0.3861
+    Samples   : 2381 (944 toxic, 1437 non-toxic)
+
+  Binary Confusion Matrix:
+                  Pred Non-toxic   Pred Toxic
+    True Non-toxic        1068          369
+    True Toxic             335          609
+
+  Calibration:
+    Temperature : 1.1871
+    (T > 1 = softened predictions, T < 1 = sharpened)
+
+  Severity labels (anchored to 0.5 binary decision boundary):
+    0.00-0.20 = Non-toxic       (very confident non-toxic)
+    0.20-0.50 = Unlikely toxic  (leans non-toxic)
+    0.50-0.65 = Likely toxic    (leans toxic, lower confidence)
+    0.65-0.80 = Moderately toxic (moderately confident toxic)
+    0.80-1.00 = Highly toxic    (very confident toxic)

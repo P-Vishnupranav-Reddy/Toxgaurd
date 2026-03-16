@@ -1,0 +1,54 @@
+{
+  "test_results": [
+    {
+      "test_loss": 0.1516970545053482,
+      "test_acc": 0.7067082524299622,
+      "test_auroc": 0.7687094807624817,
+      "test_auprc": 0.8021296858787537
+    }
+  ],
+  "lora_stats": {
+    "total_params": 8175873,
+    "trainable_params": 1147905,
+    "frozen_params": 7027968,
+    "lora_params": 1048576,
+    "num_lora_layers": 32,
+    "trainable_pct": 14.040152042479134
+  },
+  "config": {
+    "checkpoint": "iupacGPT\\iupac-gpt\\checkpoints\\iupac",
+    "tokenizer": "iupacGPT\\iupac-gpt\\iupac_gpt\\iupac_spm.model",
+    "data_dir": "./data",
+    "output_dir": "./outputs",
+    "max_length": 300,
+    "val_split": 0.1,
+    "test_split": 0.1,
+    "split_method": "scaffold",
+    "lora_rank": 32,
+    "lora_alpha": 64.0,
+    "lora_dropout": 0.2,
+    "lora_targets": "c_attn,c_proj,c_fc",
+    "batch_size": 16,
+    "max_epochs": 40,
+    "learning_rate": 0.0001,
+    "weight_decay": 0.01,
+    "warmup_steps": 600,
+    "scheduler": "cosine",
+    "grad_clip": 1.0,
+    "grad_accumulation": 1,
+    "precision": "16-mixed",
+    "val_check_interval": 1.0,
+    "binary_loss_weight": 1.0,
+    "auto_class_weight": true,
+    "use_focal_loss": true,
+    "focal_gamma": 2.0,
+    "focal_alpha": 0.45,
+    "es_patience": 10,
+    "es_min_delta": 0.001,
+    "devices": 1,
+    "num_workers": 4,
+    "seed": 42,
+    "run_dir": "./outputs\\run_20260316_044629",
+    "run_name": "run_20260316_044629"
+  }
+}

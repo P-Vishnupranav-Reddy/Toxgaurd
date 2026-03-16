@@ -4,13 +4,16 @@ STEP 5 -- Train ToxGuard (LoRA Fine-tuning)
 ============================================
 Reads  :  data/toxcast_final.csv             <- ToxCast (binary from 617 assays)
           data/tox21_final.csv              <- Tox21 (binary from 12 assays)
-          data/t3db_processed.csv           <- T3DB (all toxic)
-          data/clintox_final.csv            <- ClinTox (FDA approval + clinical tox)
           data/herg_final.csv               <- hERG (cardiotoxicity — hERG blocker)
           data/dili_final.csv               <- DILI (drug-induced liver injury)
           data/common_molecules_final.csv   <- curated ~1100 short-IUPAC molecules
           iupacGPT/iupac-gpt/checkpoints/iupac/  <- IUPACGPT backbone
           outputs/lora_config.json               <- LoRA config from step 4
+
+NOTE: T3DB and ClinTox are intentionally excluded from training.
+      T3DB is 99.2% toxic and would severely bias the model toward over-predicting
+      toxicity. ClinTox is 3.4% toxic and would harm recall.
+      Both are used as external validation sets via step6_evaluate.py.
 
 Outputs:  outputs/<run_name>/lora_weights.pt    <- trained LoRA adapter weights
           outputs/<run_name>/checkpoints/       <- Lightning checkpoints
@@ -109,6 +112,7 @@ def main(args: argparse.Namespace):
         test_split=args.test_split,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        split_method=args.split_method,
     )
     logger.info(f"Train batches: {len(train_loader)}, "
                 f"Val: {len(val_loader)}, Test: {len(test_loader)}")
@@ -133,31 +137,17 @@ def main(args: argparse.Namespace):
         logger.info(f"Using focal loss (gamma={args.focal_gamma}, alpha={args.focal_alpha})")
 
     # ── LoRA ──
-    # Try to load LoRA config from step4's output
-    lora_cfg_path = os.path.join(args.output_dir, "lora_config.json")
-    if os.path.exists(lora_cfg_path) and not any(
-        getattr(args, a, None) is not None
-        for a in ["_lora_rank_set", "_lora_alpha_set"]
-    ):
-        with open(lora_cfg_path) as f:
-            saved_cfg = json.load(f)
-        logger.info(f"Using LoRA config from step 4: {lora_cfg_path}")
-        lora_config = LoRAConfig(
-            r=saved_cfg.get("r", args.lora_rank),
-            alpha=saved_cfg.get("alpha", args.lora_alpha),
-            dropout=saved_cfg.get("dropout", args.lora_dropout),
-            target_modules=saved_cfg.get("target_modules",
-                                          args.lora_targets.split(",")),
-            fan_in_fan_out=True,
-        )
-    else:
-        lora_config = LoRAConfig(
-            r=args.lora_rank,
-            alpha=args.lora_alpha,
-            dropout=args.lora_dropout,
-            target_modules=args.lora_targets.split(","),
-            fan_in_fan_out=True,
-        )
+    # CLI args ALWAYS win. lora_config.json from step4 is only informational.
+    # This prevents the stale global config from silently overriding what was requested.
+    lora_config = LoRAConfig(
+        r=args.lora_rank,
+        alpha=args.lora_alpha,
+        dropout=args.lora_dropout,
+        target_modules=args.lora_targets.split(","),
+        fan_in_fan_out=True,
+    )
+    logger.info(f"LoRA config: rank={lora_config.r}, alpha={lora_config.alpha}, "
+                f"dropout={lora_config.dropout}, targets={lora_config.target_modules}")
 
     logger.info(f"Applying LoRA (rank={lora_config.r}, alpha={lora_config.alpha}, "
                 f"dropout={lora_config.dropout})...")
@@ -246,6 +236,22 @@ def main(args: argparse.Namespace):
     save_lora_weights(model, lora_save_path)
     logger.info(f"LoRA weights saved to: {lora_save_path}")
 
+    # Update global lora_config.json to reflect the rank actually used in this run
+    global_lora_cfg = {
+        "r": lora_config.r,
+        "alpha": lora_config.alpha,
+        "dropout": lora_config.dropout,
+        "target_modules": lora_config.target_modules,
+        "fan_in_fan_out": True,
+        "total_params": lora_stats["total_params"],
+        "trainable_params": lora_stats["trainable_params"],
+        "lora_params": lora_stats["lora_params"],
+        "trainable_pct": round(lora_stats["trainable_pct"], 4),
+    }
+    with open(os.path.join(args.output_dir, "lora_config.json"), "w") as f:
+        json.dump(global_lora_cfg, f, indent=2)
+    logger.info(f"Updated outputs/lora_config.json (r={lora_config.r})")
+
     # ── Save results ──
     results = {
         "test_results": test_results,
@@ -297,14 +303,16 @@ def parse_args() -> argparse.Namespace:
                         help="Fraction of data for validation")
     parser.add_argument("--test_split", type=float, default=0.1,
                         help="Fraction of data for test")
+    parser.add_argument("--split_method", type=str, choices=["random", "scaffold"], default="scaffold",
+                        help="Train/val/test splitting strategy. 'scaffold' prevents data leakage.")
 
     # LoRA
-    parser.add_argument("--lora_rank", type=int, default=16,
-                        help="LoRA rank (r). Rank 16 balances capacity vs efficiency for this 7M-param model.")
-    parser.add_argument("--lora_alpha", type=float, default=32.0,
+    parser.add_argument("--lora_rank", type=int, default=32,
+                        help="LoRA rank (r). Rank 32 gives ~14% trainable params for this 7M-param model.")
+    parser.add_argument("--lora_alpha", type=float, default=64.0,
                         help="LoRA scaling alpha (keep alpha = 2*rank for stable scaling)")
-    parser.add_argument("--lora_dropout", type=float, default=0.15,
-                        help="LoRA dropout (0.15 balanced regularization)")
+    parser.add_argument("--lora_dropout", type=float, default=0.2,
+                        help="LoRA dropout (0.2 for stronger regularization with r=32)")
     parser.add_argument("--lora_targets", default="c_attn,c_proj,c_fc",
                         help="LoRA target modules: c_attn+c_proj (attention) + c_fc (MLP FFN)")
 
@@ -318,8 +326,8 @@ def parse_args() -> argparse.Namespace:
                         help="Peak learning rate (1e-4 for stable LoRA fine-tuning)")
     parser.add_argument("--weight_decay", type=float, default=0.01,
                         help="AdamW weight decay")
-    parser.add_argument("--warmup_steps", type=int, default=300,
-                        help="Linear warmup steps (increased for rank-16 LoRA stability)")
+    parser.add_argument("--warmup_steps", type=int, default=600,
+                        help="Linear warmup steps (increased for rank-32 LoRA stability)")
     parser.add_argument("--scheduler", default="cosine",
                         choices=["cosine", "exponential", "none"],
                         help="LR scheduler type")
@@ -332,25 +340,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_check_interval", type=float, default=1.0,
                         help="How often to run validation (1.0 = every epoch)")
 
-    # Loss weights
+    # Loss & Class Imbalance
     parser.add_argument("--binary_loss_weight", type=float, default=1.0,
-                        help="Weight for binary classification loss")
-
-    # Class imbalance
-    parser.add_argument("--auto_class_weight", action="store_true",
-                        help="Auto-compute pos_weight from training data to address class imbalance")
-    parser.add_argument("--use_focal_loss", action="store_true",
-                        help="Use focal loss instead of BCE (down-weights easy examples)")
+                        help="Weight for the binary toxicity loss head")
+    parser.add_argument("--auto_class_weight", action="store_false", default=True,
+                        help="Auto-compute class weights from training distribution (now default). Use --no_auto_class_weight to disable.")
+    parser.add_argument("--use_focal_loss", action="store_true", default=True,
+                        help="Use focal loss instead of standard BCE (helps with hard examples)")
     parser.add_argument("--focal_gamma", type=float, default=2.0,
                         help="Focal loss gamma (focusing parameter)")
-    parser.add_argument("--focal_alpha", type=float, default=0.25,
-                        help="Focal loss alpha (class balance weight)")
+    parser.add_argument("--focal_alpha", type=float, default=0.45,
+                        help="Focal loss alpha weight for the toxic class. "
+                             "0.45 is calibrated for the ~54%% toxic imbalance "
+                             "after removing T3DB and ClinTox from training. "
+                             "(0.5 = no correction; lower values penalise FN more).")
 
 
     # Early stopping
-    parser.add_argument("--es_patience", type=int, default=5,
-                        help="Early stopping patience (epochs). 5 prevents overfitting "
-                             "while allowing recovery from brief plateaus.")
+    parser.add_argument("--es_patience", type=int, default=10,
+                        help="Early stopping patience (epochs). 10 allows recovery from longer plateaus.")
     parser.add_argument("--es_min_delta", type=float, default=1e-3,
                         help="Early stopping minimum improvement")
 

@@ -72,6 +72,7 @@ class ToxGuardPredictor:
         lora_weights_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
         device: str = "cpu",
+        lora_config=None,
     ) -> "ToxGuardPredictor":
         """Load a complete ToxGuard predictor from saved checkpoint.
 
@@ -80,6 +81,9 @@ class ToxGuardPredictor:
             lora_weights_path: Path to saved LoRA adapter weights
             tokenizer_path: Path to tokenizer (iupac_spm.model or .pt)
             device: 'cpu' or 'cuda'
+            lora_config: LoRAConfig instance. If None, uses LoRAConfig() defaults
+                         (r=32, alpha=64, dropout=0.2). Pass an explicit config to
+                         match the rank used during training.
         """
         from .model import ToxGuardModel
         from .tokenizer import get_tokenizer
@@ -95,8 +99,10 @@ class ToxGuardPredictor:
         model = ToxGuardModel.from_pretrained_iupacgpt(checkpoint_dir)
         model.config.pad_token_id = tokenizer.pad_token_id
 
-        # Apply LoRA structure
-        model, _ = apply_lora_to_model(model, LoRAConfig())
+        # Apply LoRA structure with the provided (or default) config
+        if lora_config is None:
+            lora_config = LoRAConfig()
+        model, _ = apply_lora_to_model(model, lora_config)
 
         # Load trained LoRA weights
         if lora_weights_path:

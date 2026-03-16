@@ -1,0 +1,80 @@
+============================================================
+  TOXGUARD EVALUATION REPORT
+============================================================
+
+  Threshold Tuning (validation set sweep 0.10–0.90):
+    Best F1  threshold : 0.36  (val F1=0.7727)
+    Best MCC threshold : 0.43  (val MCC=0.4149)
+    Best Acc threshold : 0.43  (val Acc=0.7167)
+    Operative threshold: 0.43  (best MCC)
+
+  Binary Classification Metrics @ threshold=0.50 (default):
+    AUC-ROC   : 0.7687
+    AUC-PRC   : 0.8027
+    Accuracy  : 0.7072
+    Precision : 0.7191
+    Recall    : 0.7661
+    F1 Score  : 0.7419
+    MCC       : 0.4056
+
+  Binary Classification Metrics @ threshold=0.43 (tuned):
+    AUC-ROC   : 0.7687
+    AUC-PRC   : 0.8027
+    Accuracy  : 0.6932
+    Precision : 0.6855
+    Recall    : 0.8153
+    F1 Score  : 0.7448
+    MCC       : 0.3761
+    Samples   : 1923 (1056 toxic, 867 non-toxic)
+
+  Binary Confusion Matrix (tuned threshold=0.43):
+                  Pred Non-toxic   Pred Toxic
+    True Non-toxic         472          395
+    True Toxic             195          861
+
+  Calibration:
+    Temperature : 1.2023
+    (T > 1 = softened predictions, T < 1 = sharpened)
+
+  Severity labels (anchored to 0.5 binary decision boundary):
+    0.00-0.20 = Non-toxic       (very confident non-toxic)
+    0.20-0.50 = Unlikely toxic  (leans non-toxic)
+    0.50-0.65 = Likely toxic    (leans toxic, lower confidence)
+    0.65-0.80 = Moderately toxic (moderately confident toxic)
+    0.80-1.00 = Highly toxic    (very confident toxic)
+
+============================================================
+  EXTERNAL VALIDATION (datasets excluded from training)
+============================================================
+  NOTE: These datasets were NEVER used during training.
+  Results reflect generalisation to unseen distributions.
+
+  T3DB External Validation (n=3505, 3505 toxic / 0 non-toxic):
+    Threshold used : 0.43 (best val MCC)
+    AUC-ROC        : nan
+    AUC-PRC        : 1.0000
+    Accuracy       : 0.8211
+    Precision      : 1.0000
+    Recall         : 0.8211  <-- headline metric (near-all-toxic corpus)
+    Specificity    : nan
+    F1             : 0.9018
+    MCC            : 0.0000
+    Confusion matrix:
+                      Pred Non-toxic   Pred Toxic
+      True Non-toxic           0            0
+      True Toxic             627         2878
+
+  CLINTOX External Validation (n=578, 25 toxic / 553 non-toxic):
+    Threshold used : 0.43 (best val MCC)
+    AUC-ROC        : 0.4319
+    AUC-PRC        : 0.0373
+    Accuracy       : 0.3304
+    Precision      : 0.0383
+    Recall         : 0.6000
+    Specificity    : 0.3183  <-- headline metric (FDA-approved drug corpus)
+    F1             : 0.0719
+    MCC            : -0.0356
+    Confusion matrix:
+                      Pred Non-toxic   Pred Toxic
+      True Non-toxic         176          377
+      True Toxic              10           15

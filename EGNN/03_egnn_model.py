@@ -174,6 +174,9 @@ class EGNNLayer(nn.Module):
                 weighted_diff = coord_diff_norm * coord_weights  # (E, 3)
             else:
                 weighted_diff = coord_diff * coord_weights  # (E, 3)
+
+            # Keep scatter-add dtype consistent under AMP.
+            weighted_diff = weighted_diff.to(dtype=x.dtype)
             
             # Aggregate coordinate updates
             x_update = torch.zeros_like(x)
@@ -189,6 +192,8 @@ class EGNNLayer(nn.Module):
             x_out = x
         
         # --- Message aggregation: m_i = Σ_j m_ij ---
+        # Keep scatter-add dtype consistent under AMP.
+        m_ij = m_ij.to(dtype=h.dtype)
         m_i = torch.zeros_like(h)
         m_i.index_add_(0, row, m_ij)
         

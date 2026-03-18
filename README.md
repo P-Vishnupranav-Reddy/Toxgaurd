@@ -59,6 +59,30 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 pip install -r requirements.txt
 ```
 
+### 4A. Install EGNN dependencies (for EGNN steps 01-06)
+
+The EGNN pipeline needs additional graph/chemistry packages that are not part of `requirements.txt`.
+
+```bash
+# PyTorch Geometric (requires PyTorch already installed)
+pip install torch-geometric
+
+# RDKit for molecule parsing and 3D conformer generation
+pip install rdkit
+```
+
+If `pip install rdkit` fails on your platform, use Conda instead:
+
+```bash
+conda install -c conda-forge rdkit
+```
+
+Quick verify for EGNN dependencies:
+
+```bash
+python -c "import torch, torch_geometric; from rdkit import Chem; print('EGNN deps OK')"
+```
+
 ### 5. Verify the setup
 
 ```bash

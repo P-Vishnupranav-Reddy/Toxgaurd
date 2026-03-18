@@ -1,0 +1,2 @@
+final_egnn_datasets/*.pt filter=lfs diff=lfs merge=lfs -text
+outputs_egnn/*.pt filter=lfs diff=lfs merge=lfs -text

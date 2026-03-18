@@ -1,5 +1,9 @@
 # ── Virtual environment ───────────────────────────────────────
 toxguard_env/
+venv311/
+.venv/
+venv/
+env/
 
 # ── Python cache ──────────────────────────────────────────────
 __pycache__/
@@ -36,6 +40,9 @@ iupacGPT/iupac-gpt/iupac_gpt/iupacs_logp.csv
 data/iupac_cs_failed_cache.csv
 data/iupac_failed_cache.csv
 data/iupac_name_cache.csv
+
+# ── EGNN generated outputs ────────────────────────────────────
+outputs_egnn/
 
 # ── OS / editor noise ─────────────────────────────────────────
 .DS_Store
